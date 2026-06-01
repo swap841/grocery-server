@@ -1064,13 +1064,14 @@ app.post("/api/config", async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
-    const { branding, store, features, seo, contact } = req.body;
+    const { branding, store, features, seo, contact, ai } = req.body;
     const updateData = {};
     if (branding !== undefined) updateData.branding = branding;
     if (store !== undefined) updateData.store = store;
     if (features !== undefined) updateData.features = features;
     if (seo !== undefined) updateData.seo = seo;
     if (contact !== undefined) updateData.contact = contact;
+    if (ai !== undefined) updateData.ai = ai;
     updateData.updatedAt = new Date().toISOString();
 
     await db.collection("appConfig").doc("main").set(updateData, { merge: true });

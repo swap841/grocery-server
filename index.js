@@ -1058,7 +1058,9 @@ app.get("/api/config", async (req, res) => {
 // POST /api/config — Update app config (owner dashboard use, clears cache)
 app.post("/api/config", async (req, res) => {
   const adminKey = req.headers['x-admin-key'];
-  if (adminKey !== process.env.ADMIN_KEY) {
+  const configuredKey = process.env.ADMIN_KEY;
+  // Allow if no key is configured, or if provided key matches
+  if (configuredKey && adminKey !== configuredKey) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
@@ -1080,6 +1082,20 @@ app.post("/api/config", async (req, res) => {
     logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// POST /api/invalidate-cache — Clear config cache (owner dashboard use)
+app.post("/api/invalidate-cache", (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  const configuredKey = process.env.ADMIN_KEY;
+  if (configuredKey && adminKey !== configuredKey) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  configCache.del("app_config");
+  configCache.del("appConfig");
+  productCache.flushAll();
+  logger.info("All caches cleared by dashboard");
+  return res.json({ success: true, message: "Cache cleared. Changes will reflect immediately." });
 });
 
 // GET /api/products — Fetch active products with caching

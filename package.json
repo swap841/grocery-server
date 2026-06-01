@@ -17,7 +17,9 @@
     "firebase-admin": "^13.10.0",
     "helmet": "^8.0.0",
     "morgan": "^1.10.0",
+    "multer": "^2.1.1",
     "winston": "^3.17.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "node-cache": "^5.1.2"
   }
 }

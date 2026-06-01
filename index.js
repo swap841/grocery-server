@@ -1,95 +1,136 @@
-const express = require("express");
-const cors = require("cors");
-const admin = require("firebase-admin");
 require("dotenv").config();
 
-// ─── Initialize Firebase Admin (supports both local and Render) ───
+const express = require("express");
+const compression = require("compression");
+const admin = require("firebase-admin");
+const { FieldValue } = require("firebase-admin/firestore");
+
+const {
+  corsMiddleware,
+  helmetMiddleware,
+  generalLimiter,
+  apiKeyAuth,
+  inputSanitizer,
+} = require("./middleware/security");
+
+const {
+  validate,
+  verifyDeliveryCodeSchema,
+  dispatchToThirdPartySchema,
+  thirdPartyWebhookSchema,
+  paySalarySchema,
+  sendSMSOTPSchema,
+} = require("./middleware/validation");
+
+const { logger, morganMiddleware, errorHandler, logErrorToFirestore } = require("./middleware/logging");
+
+// ─── Initialize Firebase Admin ───
 if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
-  // Render deployment: load from environment variable
   const serviceAccount = JSON.parse(
     Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
   );
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-  console.log("Firebase Admin initialized from environment variable");
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  logger.info("Firebase Admin initialized from environment variable");
 } else {
-  // Local development: load from JSON file
   try {
     const serviceAccount = require("./serviceAccountKey.json");
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-    console.log("Firebase Admin initialized from local JSON file");
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    logger.info("Firebase Admin initialized from local JSON file");
   } catch (err) {
-    console.error(
-      "Failed to initialize Firebase Admin. " +
-      "Provide FIREBASE_SERVICE_ACCOUNT_BASE64 env var or place serviceAccountKey.json in the server folder."
-    );
+    logger.error("Failed to initialize Firebase Admin. Provide FIREBASE_SERVICE_ACCOUNT_BASE64 or serviceAccountKey.json");
     process.exit(1);
   }
 }
 
 const db = admin.firestore();
+db.settings({ ignoreUndefinedProperties: true });
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+const startTime = Date.now();
 
-app.use(cors());
-app.use(express.json());
+// ─── Middleware ───
+app.use(compression());
+app.use(helmetMiddleware);
+app.use(corsMiddleware);
+app.use(express.json({ limit: "1mb" }));
+app.use(inputSanitizer);
+app.use(morganMiddleware);
+app.use(generalLimiter);
 
-// ─── Helpers ───
-async function sendFCMToToken(token, title, body, data = {}) {
+// ─── Cache control helper ───
+function cacheControl(duration) {
+  return (req, res, next) => {
+    res.set("Cache-Control", `public, max-age=${duration}, s-maxage=${duration}`);
+    next();
+  };
+}
+
+// ─── FCM Helpers with retry ───
+async function sendFCMToTokenWithRetry(token, title, body, data = {}, retries = 2) {
   if (!token) {
-    console.warn("sendFCMToToken: no token provided");
-    return;
+    logger.warn("FCM: no token provided");
+    return null;
   }
-  try {
-    await admin.messaging().send({
-      token,
-      notification: { title, body },
-      data,
-    });
-    console.log(`FCM sent to token: ${token.substring(0, 10)}...`);
-  } catch (err) {
-    console.error("FCM send error:", err.code || err.message);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const result = await admin.messaging().send({
+        token,
+        notification: { title, body },
+        data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? "")])),
+      });
+      logger.debug(`FCM sent to ${token.substring(0, 10)}... (attempt ${attempt + 1})`);
+      return result;
+    } catch (err) {
+      const isLast = attempt === retries;
+      logger.warn(`FCM attempt ${attempt + 1}/${retries + 1} failed for ${token.substring(0, 10)}...: ${err.code || err.message}`);
+      if (isLast) {
+        logger.error(`FCM exhausted retries for token`, { token: token.substring(0, 10) });
+        if (err.code === "messaging/registration-token-not-registered") {
+          logger.warn(`Token not registered, consider removing: ${token.substring(0, 10)}`);
+        }
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
   }
 }
 
 async function sendFCMToTokens(tokens, title, body, data = {}) {
   if (tokens.length === 0) return;
   const results = await Promise.allSettled(
-    tokens.map((t) => sendFCMToToken(t, title, body, data))
+    tokens.map((t) => sendFCMToTokenWithRetry(t, title, body, data))
   );
-  results.forEach((r, i) => {
-    if (r.status === "rejected") {
-      console.error(`FCM multicast failed for token ${i}:`, r.reason);
-    }
-  });
+  const failures = results.filter((r) => r.status === "rejected").length;
+  if (failures > 0) logger.warn(`FCM multicast: ${failures}/${tokens.length} failed`);
 }
 
-// ─── Firestore Listeners ───
+// ─── Firestore Listeners (debounced) ───
 let listeners = [];
 
+function debounce(fn, ms = 1000) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
 function startListeners() {
-  // 1. New pending orders → notify all active workers
+  // 1. New pending orders → notify workers
   const unsubOrders = db.collectionGroup("orders").onSnapshot(
     (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type !== "added") return;
         const order = change.doc.data();
         if (!order || order.status !== "Pending") return;
-
         try {
-          const workersSnap = await db
-            .collection("workers")
-            .where("active", "==", true)
-            .get();
+          const workersSnap = await db.collection("workers").where("active", "==", true).limit(50).get();
           const tokens = [];
           workersSnap.forEach((doc) => {
             const token = doc.data().fcmToken;
             if (token) tokens.push(token);
           });
-
           if (tokens.length > 0) {
             await sendFCMToTokens(tokens, "New Order", "New order pending! Claim it now.", {
               type: "new_order",
@@ -97,11 +138,11 @@ function startListeners() {
             });
           }
         } catch (err) {
-          console.error("Error notifying workers:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("Orders listener error:", err.message)
+    (err) => logger.error("Orders listener error:", err)
   );
   listeners.push(unsubOrders);
 
@@ -111,113 +152,87 @@ function startListeners() {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type !== "modified") return;
         const order = change.doc.data();
-        const newStatus = order.status;
+        const newStatus = order?.status;
         if (!newStatus) return;
-
         const triggerStatuses = ["Packing", "Out for Delivery", "Delivered"];
         if (!triggerStatuses.includes(newStatus)) return;
-
-        const pathParts = change.doc.ref.path.split("/");
-        const userId = pathParts[1];
-
+        const userId = change.doc.ref.path.split("/")[1];
         try {
           const userDoc = await db.collection("users").doc(userId).get();
           const fcmToken = userDoc.data()?.fcmToken;
-
           if (fcmToken) {
-            const body =
-              newStatus === "Packing"
-                ? "Your order is being packed!"
-                : newStatus === "Out for Delivery"
-                ? "Your order is out for delivery!"
-                : "Your order has been delivered!";
-
-            await sendFCMToToken(fcmToken, "Order Update", body, {
-              type: "order_status",
-              orderId: change.doc.id,
-              status: newStatus,
+            const body = newStatus === "Packing" ? "Your order is being packed!"
+              : newStatus === "Out for Delivery" ? "Your order is out for delivery!"
+              : "Your order has been delivered!";
+            await sendFCMToTokenWithRetry(fcmToken, "Order Update", body, {
+              type: "order_status", orderId: change.doc.id, status: newStatus,
             });
           }
         } catch (err) {
-          console.error("Error notifying customer:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("Status listener error:", err.message)
+    (err) => logger.error("Status listener error:", err)
   );
   listeners.push(unsubStatus);
 
-  // 3. Awaiting Verification → generate OTP + notify customer
+  // 3. Awaiting Verification → generate OTP
   const unsubOTP = db.collectionGroup("orders").onSnapshot(
     (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type !== "modified") return;
         const order = change.doc.data();
-        if (
-          !order ||
-          order.status !== "Awaiting Verification" ||
-          order.verificationCode
-        ) {
-          return;
-        }
-
+        if (!order || order.status !== "Awaiting Verification" || order.verificationCode) return;
         const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const pathParts = change.doc.ref.path.split("/");
-        const userId = pathParts[1];
-        const orderId = pathParts[3];
-
+        const [userId, , orderId] = change.doc.ref.path.split("/").filter(Boolean);
         try {
           await change.doc.ref.update({ verificationCode: code });
-
           const userDoc = await db.collection("users").doc(userId).get();
           const fcmToken = userDoc.data()?.fcmToken;
-
           if (fcmToken) {
-            await sendFCMToToken(fcmToken, "Delivery Verification", `Your OTP is: ${code}`, {
-              type: "delivery_otp",
-              orderId,
-              code,
+            await sendFCMToTokenWithRetry(fcmToken, "Delivery Verification", `Your OTP is: ${code}`, {
+              type: "delivery_otp", orderId, code,
             });
           }
-          console.log(`OTP ${code} generated for order ${orderId}`);
+          logger.info(`OTP ${code} generated for order ${orderId}`);
         } catch (err) {
-          console.error("Error generating OTP:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("OTP listener error:", err.message)
+    (err) => logger.error("OTP listener error:", err)
   );
   listeners.push(unsubOTP);
 
-  // 4. Low stock → notify owner
+  // 4. Low stock → notify owner (debounced)
+  const debouncedLowStock = debounce(async (productId, product) => {
+    try {
+      const infoSnap = await db.collection("contactInfo").doc("info").get();
+      const ownerFcmToken = infoSnap.data()?.ownerFcmToken;
+      if (ownerFcmToken) {
+        await sendFCMToTokenWithRetry(ownerFcmToken, "Low Stock Alert",
+          `${product.name || "Product"} is low (${product.stock ?? 0} left)`,
+          { type: "low_stock", productId });
+      }
+    } catch (err) {
+      logErrorToFirestore(err);
+    }
+  }, 5000);
+
   const unsubStock = db.collection("products").onSnapshot(
     (snapshot) => {
-      snapshot.docChanges().forEach(async (change) => {
+      snapshot.docChanges().forEach((change) => {
         if (change.type !== "modified" && change.type !== "added") return;
         const product = change.doc.data();
         if (!product) return;
-
         const stock = product.stock ?? 0;
         const threshold = product.lowStockThreshold ?? 5;
         if (stock >= threshold) return;
-
-        try {
-          const infoSnap = await db.collection("contactInfo").doc("info").get();
-          const ownerFcmToken = infoSnap.data()?.ownerFcmToken;
-          if (ownerFcmToken) {
-            await sendFCMToToken(
-              ownerFcmToken,
-              "Low Stock Alert",
-              `${product.name || "Product"} is low (${stock} left)`,
-              { type: "low_stock", productId: change.doc.id }
-            );
-          }
-        } catch (err) {
-          console.error("Error notifying owner:", err.message);
-        }
+        debouncedLowStock(change.doc.id, product);
       });
     },
-    (err) => console.error("Stock listener error:", err.message)
+    (err) => logger.error("Stock listener error:", err)
   );
   listeners.push(unsubStock);
 
@@ -228,26 +243,21 @@ function startListeners() {
         if (change.type !== "added") return;
         const basket = change.doc.data();
         if (!basket) return;
-
-        const pathParts = change.doc.ref.path.split("/");
-        const dboyId = pathParts[1];
-
+        const dboyId = change.doc.ref.path.split("/")[1];
         try {
           const dboyDoc = await db.collection("deliveryBoys").doc(dboyId).get();
           const fcmToken = dboyDoc.data()?.fcmToken;
           if (fcmToken) {
-            const orderCount = basket.orders?.length ?? 0;
-            await sendFCMToToken(fcmToken, "New Delivery Basket", `${orderCount} order(s) assigned`, {
-              type: "new_basket",
-              basketId: change.doc.id,
-            });
+            await sendFCMToTokenWithRetry(fcmToken, "New Delivery Basket",
+              `${basket.orders?.length ?? 0} order(s) assigned`,
+              { type: "new_basket", basketId: change.doc.id });
           }
         } catch (err) {
-          console.error("Error notifying delivery boy:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("Basket listener error:", err.message)
+    (err) => logger.error("Basket listener error:", err)
   );
   listeners.push(unsubBasket);
 
@@ -259,33 +269,27 @@ function startListeners() {
         if (change.type !== "added") return;
         const contact = change.doc.data();
         if (!contact) return;
-
-        // Skip if we already processed this doc on initial load
         const contactId = change.doc.id;
         if (lastKnownContactIds.has(contactId)) return;
         lastKnownContactIds.add(contactId);
-
         try {
           const infoSnap = await db.collection("contactInfo").doc("info").get();
           const ownerFcmToken = infoSnap.data()?.ownerFcmToken;
           if (ownerFcmToken) {
-            await sendFCMToToken(
-              ownerFcmToken,
-              "New Support Ticket",
+            await sendFCMToTokenWithRetry(ownerFcmToken, "New Support Ticket",
               `${contact.name || "Customer"}: ${contact.subject || "New complaint"}`,
-              { type: "new_ticket", contactId }
-            );
+              { type: "new_ticket", contactId });
           }
         } catch (err) {
-          console.error("Error notifying owner of new ticket:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("New contact listener error:", err.message)
+    (err) => logger.error("Contact listener error:", err)
   );
   listeners.push(unsubNewContact);
 
-  // 7. Support ticket reply → notify the other party
+  // 7. Ticket reply → notify other party
   const lastKnownReplyCounts = {};
   const unsubContactReply = db.collection("contacts").onSnapshot(
     (snapshot) => {
@@ -293,51 +297,37 @@ function startListeners() {
         if (change.type !== "modified") return;
         const contact = change.doc.data();
         if (!contact || !contact.replies) return;
-
         const contactId = change.doc.id;
         const currentCount = contact.replies.length;
         const prevCount = lastKnownReplyCounts[contactId] || 0;
         lastKnownReplyCounts[contactId] = currentCount;
-
         if (currentCount <= prevCount) return;
-
         const lastReply = contact.replies[currentCount - 1];
-        if (!lastReply || !lastReply.by) return;
-
+        if (!lastReply?.by) return;
         try {
-          if (lastReply.by === "owner") {
-            // Owner replied → notify customer
-            if (contact.userId) {
-              const userDoc = await db.collection("users").doc(contact.userId).get();
-              const fcmToken = userDoc.data()?.fcmToken;
-              if (fcmToken) {
-                await sendFCMToToken(
-                  fcmToken,
-                  "Owner Replied",
-                  `Reply to your ticket: ${contact.subject || "Support ticket"}`,
-                  { type: "ticket_reply", contactId }
-                );
-              }
+          if (lastReply.by === "owner" && contact.userId) {
+            const userDoc = await db.collection("users").doc(contact.userId).get();
+            const fcmToken = userDoc.data()?.fcmToken;
+            if (fcmToken) {
+              await sendFCMToTokenWithRetry(fcmToken, "Owner Replied",
+                `Reply to your ticket: ${contact.subject || "Support ticket"}`,
+                { type: "ticket_reply", contactId });
             }
           } else if (lastReply.by === "customer") {
-            // Customer replied → notify owner
             const infoSnap = await db.collection("contactInfo").doc("info").get();
             const ownerFcmToken = infoSnap.data()?.ownerFcmToken;
             if (ownerFcmToken) {
-              await sendFCMToToken(
-                ownerFcmToken,
-                "Customer Replied",
+              await sendFCMToTokenWithRetry(ownerFcmToken, "Customer Replied",
                 `${contact.name || "Customer"} replied to: ${contact.subject || "Support ticket"}`,
-                { type: "ticket_reply", contactId }
-              );
+                { type: "ticket_reply", contactId });
             }
           }
         } catch (err) {
-          console.error("Error notifying of ticket reply:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("Contact reply listener error:", err.message)
+    (err) => logger.error("Reply listener error:", err)
   );
   listeners.push(unsubContactReply);
 
@@ -350,216 +340,184 @@ function startListeners() {
         const salaryId = change.doc.id;
         if (lastKnownSalaryIds.has(salaryId)) return;
         lastKnownSalaryIds.add(salaryId);
-
         const salary = change.doc.data();
         if (!salary) return;
-
         try {
-          // collectionGroup path: "workers/{id}/salaryPayments/{salaryId}"
-          // or "deliveryBoys/{id}/salaryPayments/{salaryId}"
-          const pathParts = change.doc.ref.path.split("/");
-          const collection = pathParts[0]; // "workers" or "deliveryBoys"
-          const personId = pathParts[1];
-
+          const [collection, personId] = change.doc.ref.path.split("/");
           if (!["workers", "deliveryBoys"].includes(collection)) return;
-
           const personDoc = await db.collection(collection).doc(personId).get();
           const fcmToken = personDoc.data()?.fcmToken;
           const name = personDoc.data()?.name || "Employee";
-
           if (fcmToken) {
             const label = collection === "workers" ? "Worker" : "Delivery Boy";
-            await sendFCMToToken(
-              fcmToken,
-              "Salary Paid",
+            await sendFCMToTokenWithRetry(fcmToken, "Salary Paid",
               `${salary.monthYear || ""}: ₹${salary.amount} credited via ${salary.mode || "cash"}`,
-              { type: "salary_paid", salaryId, collection, personId }
-            );
+              { type: "salary_paid", salaryId, collection, personId });
           }
         } catch (err) {
-          console.error("Error notifying salary payment:", err.message);
+          logErrorToFirestore(err);
         }
       });
     },
-    (err) => console.error("Salary listener error:", err.message)
+    (err) => logger.error("Salary listener error:", err)
   );
   listeners.push(unsubSalary);
 
-  console.log("✅ All Firestore listeners started");
+  logger.info("All 8 Firestore listeners started");
 }
 
 // ─── HTTP Endpoints ───
 
-// Health check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+app.get("/health", async (req, res) => {
+  try {
+    const testDoc = await db.collection("health").doc("_check").get();
+    const firestoreOk = testDoc.exists || true;
+    res.json({
+      status: "ok",
+      firestore: firestoreOk ? "connected" : "error",
+      uptime: Math.floor((Date.now() - startTime) / 1000),
+      memory: process.memoryUsage(),
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(503).json({ status: "error", firestore: "disconnected", error: err.message });
+  }
 });
 
-// POST /verifyDeliveryCode
-app.post("/verifyDeliveryCode", async (req, res) => {
+app.get("/metrics", cacheControl(30), async (req, res) => {
+  const mem = process.memoryUsage();
+  const metrics = {
+    uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
+    memory_mb: {
+      rss: Math.round(mem.rss / 1024 / 1024),
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
+    },
+    listeners_active: listeners.length,
+    node_version: process.version,
+    environment: process.env.NODE_ENV || "development",
+    timestamp: new Date().toISOString(),
+  };
+  if (process.env.NODE_ENV !== "production") {
+    metrics.allowed_origins = (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean);
+  }
+  res.json(metrics);
+});
+
+app.post("/verifyDeliveryCode", validate(verifyDeliveryCodeSchema), async (req, res) => {
   try {
     const { orderId, code } = req.body;
-    if (!orderId || !code) {
-      return res.status(400).json({ success: false, error: "orderId and code required" });
-    }
-
     const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
-    if (ordersSnap.empty) {
-      return res.status(404).json({ success: false, error: "Order not found" });
-    }
-
+    if (ordersSnap.empty) return res.status(404).json({ success: false, error: "Order not found" });
     const orderDoc = ordersSnap.docs[0];
     const order = orderDoc.data();
-
-    if (order.status !== "Awaiting Verification") {
-      return res.status(400).json({ success: false, error: "Order not awaiting verification" });
-    }
-    if (order.verificationCode !== code) {
-      return res.status(403).json({ success: false, error: "Invalid code" });
-    }
-
-    await orderDoc.ref.update({
-      status: "Delivered",
-      deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
+    if (order.status !== "Awaiting Verification") return res.status(400).json({ success: false, error: "Order not awaiting verification" });
+    if (order.verificationCode !== code) return res.status(403).json({ success: false, error: "Invalid code" });
+    await orderDoc.ref.update({ status: "Delivered", deliveredAt: FieldValue.serverTimestamp() });
+    logger.info(`Order ${orderId} verified and marked delivered`);
     return res.json({ success: true, message: "Delivery verified" });
   } catch (err) {
-    console.error("verifyDeliveryCode error:", err.message);
+    logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// POST /dispatchToThirdParty
-app.post("/dispatchToThirdParty", async (req, res) => {
+app.post("/dispatchToThirdParty", validate(dispatchToThirdPartySchema), async (req, res) => {
   try {
     const { orderId, partner } = req.body;
-    if (!orderId || !partner) {
-      return res.status(400).json({ success: false, error: "orderId and partner required" });
-    }
-
-    const validPartners = ["Shiprocket", "Delhivery", "Shadowfax"];
-    if (!validPartners.includes(partner)) {
-      return res.status(400).json({ success: false, error: `Partner must be: ${validPartners.join(", ")}` });
-    }
-
     const prefix = { Shiprocket: "SR", Delhivery: "DH", Shadowfax: "SF" }[partner];
     const trackingId = `${prefix}-${Date.now()}`;
-
     await db.collection("delivery_partner_logs").add({
-      orderId,
-      partner,
-      trackingId,
+      orderId, partner, trackingId,
       status: "Dispatched",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
-
     const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
     if (!ordersSnap.empty) {
-      await ordersSnap.docs[0].ref.update({
-        outOfCity: true,
-        status: "Out for Delivery",
-      });
+      await ordersSnap.docs[0].ref.update({ outOfCity: true, status: "Out for Delivery" });
     }
-
+    logger.info(`Order ${orderId} dispatched via ${partner}, tracking: ${trackingId}`);
     return res.json({ success: true, trackingId, partner, status: "Dispatched" });
   } catch (err) {
-    console.error("dispatchToThirdParty error:", err.message);
+    logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// POST /thirdPartyWebhook
-app.post("/thirdPartyWebhook", async (req, res) => {
+app.post("/thirdPartyWebhook", apiKeyAuth, validate(thirdPartyWebhookSchema), async (req, res) => {
   try {
     const { trackingId, status, orderId } = req.body;
-    if (!trackingId || !status) {
-      return res.status(400).json({ error: "trackingId and status required" });
-    }
-
     const logsSnap = await db.collection("delivery_partner_logs").where("trackingId", "==", trackingId).limit(1).get();
-    if (logsSnap.empty) {
-      return res.status(404).json({ error: "Tracking ID not found" });
-    }
-
-    await logsSnap.docs[0].ref.update({
-      status,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
+    if (logsSnap.empty) return res.status(404).json({ error: "Tracking ID not found" });
+    await logsSnap.docs[0].ref.update({ status, updatedAt: FieldValue.serverTimestamp() });
     if (status === "Delivered" && orderId) {
       const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
-      ordersSnap.forEach((doc) => {
-        doc.ref.update({
-          status: "Delivered",
-          deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      });
+      await Promise.all(ordersSnap.docs.map((doc) =>
+        doc.ref.update({ status: "Delivered", deliveredAt: FieldValue.serverTimestamp() })
+      ));
     }
-
+    logger.info(`Webhook: ${trackingId} → ${status}`);
     return res.json({ success: true });
   } catch (err) {
-    console.error("thirdPartyWebhook error:", err.message);
+    logErrorToFirestore(err, req);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /paySalary
-app.post("/paySalary", async (req, res) => {
+app.post("/paySalary", validate(paySalarySchema), async (req, res) => {
   try {
     const { collection, personId, amount, monthYear, mode } = req.body;
-    if (!collection || !personId || !amount || !monthYear || !mode) {
-      return res.status(400).json({ success: false, error: "All fields required" });
-    }
-    if (!["workers", "deliveryBoys"].includes(collection)) {
-      return res.status(400).json({ success: false, error: "collection must be 'workers' or 'deliveryBoys'" });
-    }
-
-    const now = admin.firestore.FieldValue.serverTimestamp();
     await db.collection(collection).doc(personId).collection("salaryPayments").add({
-      amount,
-      monthYear,
-      paidAt: now,
-      mode,
+      amount, monthYear, paidAt: FieldValue.serverTimestamp(), mode,
     });
-
     await db.collection(collection).doc(personId).update({
-      totalEarnings: admin.firestore.FieldValue.increment(amount),
+      totalEarnings: FieldValue.increment(amount),
     });
-
+    logger.info(`Salary ₹${amount} paid to ${collection}/${personId} for ${monthYear}`);
     return res.json({ success: true, message: "Salary recorded" });
   } catch (err) {
-    console.error("paySalary error:", err.message);
+    logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// POST /sendSMSOTP (optional fallback)
-app.post("/sendSMSOTP", async (req, res) => {
+app.post("/sendSMSOTP", validate(sendSMSOTPSchema), async (req, res) => {
   try {
     const { phoneNumber, otp } = req.body;
-    if (!phoneNumber || !otp) {
-      return res.status(400).json({ success: false, error: "phoneNumber and otp required" });
-    }
-    console.log(`SMS OTP for ${phoneNumber}: ${otp}`);
+    logger.info(`SMS OTP for ${phoneNumber}: ${otp}`);
     return res.json({ success: true, message: "FCM is primary; SMS provider not configured." });
   } catch (err) {
+    logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ─── Error handler (must be last middleware) ───
+app.use(errorHandler);
+
 // ─── Graceful Shutdown ───
-function gracefulShutdown() {
-  console.log("\nShutting down gracefully...");
-  listeners.forEach((unsub) => unsub());
-  process.exit(0);
+function gracefulShutdown(signal) {
+  logger.info(`${signal} received. Shutting down gracefully...`);
+  listeners.forEach((unsub) => { try { unsub(); } catch (e) { /* ignore */ } });
+  listeners = [];
+  setTimeout(() => {
+    logger.info("Shutdown complete.");
+    process.exit(0);
+  }, 3000);
 }
 
-process.on("SIGTERM", gracefulShutdown);
-process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("uncaughtException", (err) => {
+  logErrorToFirestore(err);
+  logger.error("Uncaught exception", { message: err.message, stack: err.stack });
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled rejection", { reason: reason?.message || reason });
+});
 
 // ─── Start ───
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  logger.info(`Server running on port ${PORT}`);
   startListeners();
 });

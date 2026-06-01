@@ -525,7 +525,14 @@ app.post("/api/orders/create", async (req, res) => {
 
     const batch = db.batch();
 
-    // 1. Create order document
+    // 1. Create order document (dual: top-level + user subcollection)
+    const topOrderRef = db.collection("orders").doc(orderId);
+    batch.set(topOrderRef, {
+      ...orderData, id: orderId,
+      userId, payment: { method: "cod", status: "pending" },
+      status: "Pending", createdAt: now, updatedAt: now,
+    });
+
     const orderRef = db.collection("users").doc(userId).collection("orders").doc(orderId);
     batch.set(orderRef, {
       ...orderData, id: orderId,
@@ -615,6 +622,11 @@ app.post("/api/razorpay/verify-payment", async (req, res) => {
     const orderId = `order_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const now = new Date().toISOString();
     const writes = [
+      db.collection("orders").doc(orderId).set({
+        ...orderData, id: orderId, userId,
+        payment: { method: "razorpay", razorpayOrderId: razorpay_order_id, razorpayPaymentId: razorpay_payment_id, status: "paid" },
+        status: "Pending", createdAt: now, updatedAt: now,
+      }),
       db.collection("users").doc(userId).collection("orders").doc(orderId).set({
         ...orderData, id: orderId,
         payment: { method: "razorpay", razorpayOrderId: razorpay_order_id, razorpayPaymentId: razorpay_payment_id, status: "paid" },

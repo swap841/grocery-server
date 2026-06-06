@@ -9,7 +9,10 @@ let loadCount = 0;
 
 async function loadConfig() {
   try {
-    const snap = await db.doc("config/appConfig").get();
+    let snap = await db.collection("appConfig").doc("settings").get();
+    if (!snap.exists) {
+      snap = await db.collection("appConfig").doc("main").get();
+    }
     if (snap.exists) {
       currentConfig = { id: snap.id, ...snap.data() };
       configCache.set("appConfig", currentConfig);

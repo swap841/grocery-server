@@ -14,6 +14,8 @@ const {
   generalLimiter,
   apiKeyAuth,
   inputSanitizer,
+  verifyFirebaseToken,
+  requireOwner,
 } = require("./middleware/security");
 
 const {
@@ -492,7 +494,7 @@ app.post("/thirdPartyWebhook", apiKeyAuth, validate(thirdPartyWebhookSchema), as
   }
 });
 
-app.post("/paySalary", validate(paySalarySchema), async (req, res) => {
+app.post("/paySalary", verifyFirebaseToken, requireOwner, validate(paySalarySchema), async (req, res) => {
   try {
     const { collection, personId, amount, monthYear, mode } = req.body;
     await db.collection(collection).doc(personId).collection("salaryPayments").add({
@@ -538,7 +540,7 @@ async function incrementDailyStats(amount, isCancelled = false) {
 // ─── Migrated Next.js API Routes ───
 
 // 1. POST /api/orders/create — COD order creation (batch write)
-app.post("/api/orders/create", async (req, res) => {
+app.post("/api/orders/create", verifyFirebaseToken, async (req, res) => {
   try {
     const { userId, orderData, couponCode } = req.body;
     if (!userId || !orderData) {
@@ -598,7 +600,7 @@ app.post("/api/orders/create", async (req, res) => {
 });
 
 // 2. POST /api/razorpay/create-order — Create Razorpay order
-app.post("/api/razorpay/create-order", async (req, res) => {
+app.post("/api/razorpay/create-order", verifyFirebaseToken, async (req, res) => {
   try {
     const { amount, receipt } = req.body;
     if (!amount || amount <= 0) {
@@ -626,7 +628,7 @@ app.post("/api/razorpay/create-order", async (req, res) => {
 });
 
 // 3. POST /api/razorpay/verify-payment — Verify signature + create order
-app.post("/api/razorpay/verify-payment", async (req, res) => {
+app.post("/api/razorpay/verify-payment", verifyFirebaseToken, async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, orderData, couponCode } = req.body;
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -682,7 +684,7 @@ app.post("/api/razorpay/verify-payment", async (req, res) => {
 });
 
 // 4. POST /api/razorpay/refund — Process refund via Razorpay
-app.post("/api/razorpay/refund", async (req, res) => {
+app.post("/api/razorpay/refund", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     const { paymentId, amount, reason, orderId, userId, items } = req.body;
     if (!paymentId || !amount || amount <= 0 || !orderId || !userId) {
@@ -750,7 +752,7 @@ app.post("/api/upload-photo", upload.single("image"), async (req, res) => {
 });
 
 // 6. POST /api/set-owner — Set Firebase custom claims
-app.post("/api/set-owner", async (req, res) => {
+app.post("/api/set-owner", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     const { uid, email } = req.body;
     if (!uid || !email) {
@@ -829,7 +831,7 @@ app.post("/api/delivery-partner/request", async (req, res) => {
 });
 
 // ─── Inventory Lock System ───
-app.post("/api/inventory/lock", async (req, res) => {
+app.post("/api/inventory/lock", verifyFirebaseToken, async (req, res) => {
   try {
     const { items, sessionId } = req.body;
     if (!items || !Array.isArray(items) || items.length === 0 || !sessionId) {
@@ -877,7 +879,7 @@ app.post("/api/inventory/lock", async (req, res) => {
   }
 });
 
-app.post("/api/inventory/release", async (req, res) => {
+app.post("/api/inventory/release", verifyFirebaseToken, async (req, res) => {
   try {
     const { sessionId } = req.body;
     if (!sessionId) {
@@ -943,7 +945,7 @@ app.get("/api/fcm/status", apiKeyAuth, async (req, res) => {
 });
 
 // ─── Order Cancel Endpoint ───
-app.post("/api/orders/cancel", async (req, res) => {
+app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
   try {
     const { orderId, userId, reason } = req.body;
     if (!orderId || !userId) {
@@ -1006,7 +1008,7 @@ app.post("/api/orders/cancel", async (req, res) => {
 });
 
 // ─── Soft Delete / Restore for Products ───
-app.post("/api/products/archive", async (req, res) => {
+app.post("/api/products/archive", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     const { productId } = req.body;
     if (!productId) return res.status(400).json({ success: false, error: "Missing productId" });
@@ -1020,7 +1022,7 @@ app.post("/api/products/archive", async (req, res) => {
   }
 });
 
-app.post("/api/products/restore", async (req, res) => {
+app.post("/api/products/restore", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     const { productId } = req.body;
     if (!productId) return res.status(400).json({ success: false, error: "Missing productId" });
@@ -1083,13 +1085,7 @@ app.get("/api/config", async (req, res) => {
 });
 
 // POST /api/config — Update app config (owner dashboard use, clears cache)
-app.post("/api/config", async (req, res) => {
-  const adminKey = req.headers['x-admin-key'];
-  const configuredKey = process.env.ADMIN_KEY;
-  // Allow if no key is configured, or if provided key matches
-  if (configuredKey && adminKey !== configuredKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+app.post("/api/config", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     const { branding, store, features, seo, contact, ai } = req.body;
     const updateData = {};
@@ -1119,12 +1115,28 @@ app.post("/api/config", async (req, res) => {
 });
 
 // POST /api/invalidate-cache — Clear config cache (owner dashboard use)
-app.post("/api/invalidate-cache", (req, res) => {
-  const adminKey = req.headers['x-admin-key'];
-  const configuredKey = process.env.ADMIN_KEY;
-  if (configuredKey && adminKey !== configuredKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
+app.post("/api/invalidate-cache", async (req, res) => {
+  // Accept Firebase token OR admin key
+  const authHeader = req.headers.authorization;
+  const adminKey = req.headers["x-admin-key"];
+  const configuredAdminKey = process.env.ADMIN_KEY;
+
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      const decoded = await admin.auth().verifyIdToken(authHeader.split("Bearer ")[1]);
+      const userDoc = await db.collection("users").doc(decoded.uid).get();
+      if (!userDoc.exists || !userDoc.data().isOwner) {
+        return res.status(403).json({ error: "Owner access required" });
+      }
+    } catch (e) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+  } else if (configuredAdminKey && adminKey === configuredAdminKey) {
+    // Admin key accepted for server-to-server calls
+  } else {
+    return res.status(401).json({ error: "Authentication required" });
   }
+
   configCache.del("app_config");
   configCache.del("appConfig");
   productCache.flushAll();
@@ -1155,7 +1167,7 @@ app.get("/api/products", async (req, res) => {
 });
 
 // POST /api/clear-cache — Clear product cache (for owner dashboard after updates)
-app.post("/api/clear-cache", async (req, res) => {
+app.post("/api/clear-cache", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     productCache.flushAll();
     logger.info("Product cache cleared");
@@ -1247,7 +1259,7 @@ app.get("/api/track-order/:orderId", async (req, res) => {
   }
 });
 
-app.post("/api/refresh-config", async (req, res) => {
+app.post("/api/refresh-config", verifyFirebaseToken, requireOwner, async (req, res) => {
   try {
     const config = await reloadConfig();
     return res.json({ success: true, message: "Config reloaded", config: config ? { business: config.business?.name, updatedAt: config.updatedAt } : null });

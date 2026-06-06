@@ -1,6 +1,7 @@
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const cors = require("cors");
+const admin = require("firebase-admin");
 
 // ─── Helmet ───
 const helmetMiddleware = helmet({
@@ -18,9 +19,8 @@ const corsMiddleware = cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGINS.length === 0) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    if (origin.startsWith("http://localhost")) return cb(null, true);
     if (origin.startsWith("capacitor://")) return cb(null, true);
-    cb(null, true);
+    cb(new Error("Not allowed by CORS"));
   },
   credentials: true,
 });
@@ -46,6 +46,40 @@ function apiKeyAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid or missing API key" });
   }
   next();
+}
+
+// ─── Firebase ID Token Verification ───
+async function verifyFirebaseToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing or invalid authorization header" });
+  }
+  const idToken = authHeader.split("Bearer ")[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// ─── Owner Guard (requires verifyFirebaseToken first) ───
+async function requireOwner(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+  const uid = req.user.uid;
+  try {
+    const userDoc = await admin.firestore().collection("users").doc(uid).get();
+    const userData = userDoc.data();
+    if (userData && userData.isOwner === true) {
+      return next();
+    }
+    return res.status(403).json({ error: "Owner access required" });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to verify owner status" });
+  }
 }
 
 // ─── Input Sanitization ───
@@ -74,4 +108,6 @@ module.exports = {
   generalLimiter,
   apiKeyAuth,
   inputSanitizer,
+  verifyFirebaseToken,
+  requireOwner,
 };

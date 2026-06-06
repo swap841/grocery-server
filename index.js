@@ -51,6 +51,9 @@ db.settings({ ignoreUndefinedProperties: true });
 const NodeCache = require("node-cache");
 const productCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // 5 min TTL
 
+const { loadConfig: reloadConfig, getConfig } = require("./services/configLoader");
+const { dispatch: dispatchToPartner, track: trackOrder, handleWebhook } = require("./services/deliveryPartner");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const startTime = Date.now();
@@ -162,10 +165,31 @@ function startListeners() {
         const newStatus = order?.status;
         if (!newStatus) return;
 
-        // Determine user ID from path
+        // Parse Firestore document path to extract userId and orderId
         const pathParts = change.doc.ref.path.split("/");
-        const userId = pathParts[1]; // users/{userId}/orders/{orderId}
-        const orderId = pathParts[3];
+        let userId = null;
+        let orderId = null;
+
+        // Case 1: Nested subcollection path: /users/{userId}/orders/{orderId}
+        if (pathParts.length >= 4 && pathParts[0] === "users" && pathParts[2] === "orders") {
+          userId = pathParts[1];
+          orderId = pathParts[3];
+        }
+        // Case 2: Top-level collection path: /orders/{orderId}
+        else if (pathParts.length >= 2 && pathParts[0] === "orders") {
+          orderId = pathParts[1];
+          userId = (change.doc.data())?.userId; // Extract userId from document data
+        }
+        // Case 3: Unknown path structure - log and skip
+        else {
+          console.warn(`[Firestore] Unknown path structure: ${change.doc.ref.path}`);
+          return;
+        }
+
+        if (!orderId) {
+          console.warn(`[Firestore] Could not extract orderId from path: ${change.doc.ref.path}`);
+          return;
+        }
 
         // --- Part A: Notify customer on status transitions ---
         const triggerStatuses = ["Packing", "Out for Delivery", "Delivered"];
@@ -1036,7 +1060,10 @@ app.get("/api/config", async (req, res) => {
       res.set("X-Cache", "HIT");
       return res.json(cached);
     }
-    const snap = await db.collection("appConfig").doc("main").get();
+    let snap = await db.collection("appConfig").doc("settings").get();
+    if (!snap.exists) {
+      snap = await db.collection("appConfig").doc("main").get();
+    }
     let config;
     if (snap.exists) {
       config = { id: snap.id, ...snap.data() };
@@ -1075,6 +1102,12 @@ app.post("/api/config", async (req, res) => {
     updateData.updatedAt = new Date().toISOString();
 
     await db.collection("appConfig").doc("main").set(updateData, { merge: true });
+    // Also sync to settings doc if it exists (prefer settings)
+    const settingsRef = db.collection("appConfig").doc("settings");
+    const settingsSnap = await settingsRef.get();
+    if (settingsSnap.exists) {
+      await settingsRef.set(updateData, { merge: true });
+    }
     configCache.del("app_config");
     productCache.flushAll();
     logger.info("App config updated");
@@ -1130,6 +1163,125 @@ app.post("/api/clear-cache", async (req, res) => {
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── Delivery Partner Dispatch ───
+app.post("/api/dispatch-to-partner", async (req, res) => {
+  try {
+    const { orderId, userId, partnerName } = req.body;
+    if (!orderId || !partnerName) {
+      return res.status(400).json({ success: false, error: "Missing orderId or partnerName" });
+    }
+    const config = getConfig();
+    const credentials = config?.delivery?.partners?.[partnerName?.toLowerCase()]?.credentials;
+    if (!credentials) {
+      return res.status(400).json({ success: false, error: `No credentials configured for ${partnerName}` });
+    }
+    const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
+    if (ordersSnap.empty) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+    const orderDoc = ordersSnap.docs[0];
+    const order = { id: orderDoc.id, ...orderDoc.data() };
+    const result = await dispatchToPartner(order, partnerName, credentials);
+    if (!result.success) {
+      return res.status(500).json({ success: false, error: result.error });
+    }
+    await db.collection("delivery_partner_logs").add({
+      orderId, userId: userId || order.userId, partner: partnerName,
+      trackingId: result.trackingId, status: "Dispatched",
+      dispatchedAt: new Date().toISOString(),
+    });
+    logger.info(`Order ${orderId} dispatched via ${partnerName}, tracking: ${result.trackingId}`);
+    return res.json({ success: true, trackingId: result.trackingId, eta: result.eta });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message || "Dispatch failed" });
+  }
+});
+
+app.post("/api/partner-webhook", async (req, res) => {
+  try {
+    const { partner, trackingId, status, orderId } = req.body;
+    if (!partner) {
+      return res.status(400).json({ success: false, error: "Missing partner name" });
+    }
+    const result = await handleWebhook(partner, req.body);
+    if (trackingId) {
+      const logsSnap = await db.collection("delivery_partner_logs").where("trackingId", "==", trackingId).limit(1).get();
+      if (!logsSnap.empty) {
+        await logsSnap.docs[0].ref.update({
+          status: status || "updated",
+          updatedAt: new Date().toISOString(),
+          webhookReceived: true,
+        });
+      }
+    }
+    if ((status === "Delivered" || status === "delivered") && orderId) {
+      const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
+      for (const doc of ordersSnap.docs) {
+        await doc.ref.update({ status: "Delivered", deliveredAt: new Date().toISOString() });
+      }
+    }
+    logger.info(`Webhook from ${partner}: ${trackingId} → ${status}`);
+    return res.json({ success: true });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message || "Webhook processing failed" });
+  }
+});
+
+app.get("/api/track-order/:orderId", async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const logsSnap = await db.collection("delivery_partner_logs").where("orderId", "==", orderId).orderBy("createdAt", "desc").limit(1).get();
+    if (logsSnap.empty) {
+      return res.json({ orderId, status: "unknown", message: "No tracking information available" });
+    }
+    const log = { id: logsSnap.docs[0].id, ...logsSnap.docs[0].data() };
+    return res.json({ orderId, trackingId: log.trackingId, partner: log.partner, status: log.status, dispatchedAt: log.dispatchedAt });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message || "Tracking lookup failed" });
+  }
+});
+
+app.post("/api/refresh-config", async (req, res) => {
+  try {
+    const config = await reloadConfig();
+    return res.json({ success: true, message: "Config reloaded", config: config ? { business: config.business?.name, updatedAt: config.updatedAt } : null });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message || "Config reload failed" });
+  }
+});
+
+app.get("/api/app-config", async (req, res) => {
+  try {
+    const config = getConfig();
+    if (!config) {
+      return res.status(503).json({ success: false, error: "Config not loaded yet" });
+    }
+    const safeConfig = { ...config };
+    delete safeConfig.apiKeys;
+    delete safeConfig.secrets;
+    if (safeConfig.notifications) {
+      safeConfig.notifications = { ...safeConfig.notifications };
+      delete safeConfig.notifications.whatsAppApiKey;
+      delete safeConfig.notifications.smsApiKey;
+      delete safeConfig.notifications.smsProviderApiKey;
+    }
+    if (safeConfig.delivery?.partners) {
+      safeConfig.delivery = { ...safeConfig.delivery };
+      safeConfig.delivery.partners = Object.fromEntries(
+        Object.entries(safeConfig.delivery.partners).map(([name, p]) => [name, { enabled: p.enabled }])
+      );
+    }
+    return res.json({ success: true, config: safeConfig });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message || "Failed to fetch config" });
   }
 });
 

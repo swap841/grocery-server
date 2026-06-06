@@ -606,8 +606,9 @@ app.post("/api/razorpay/create-order", verifyFirebaseToken, async (req, res) => 
     if (!amount || amount <= 0) {
       return res.status(400).json({ error: "Invalid amount. Must be greater than 0." });
     }
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const config = getConfig();
+    const keyId = config?.payment?.razorpayKeyId || process.env.RAZORPAY_KEY_ID;
+    const keySecret = config?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
     if (!keyId || !keySecret) {
       const mockId = `order_mock_${Math.random().toString(36).substring(2, 9)}`;
       return res.json({ success: true, orderId: mockId, amount, currency: "INR", message: "Mock order (Razorpay not configured)" });
@@ -634,7 +635,8 @@ app.post("/api/razorpay/verify-payment", verifyFirebaseToken, async (req, res) =
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ success: false, error: "Missing required payment parameters" });
     }
-    const secret = process.env.RAZORPAY_KEY_SECRET;
+    const config = getConfig();
+    const secret = config?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
     if (secret) {
       const hmac = crypto.createHmac("sha256", secret);
       hmac.update(`${razorpay_order_id}|${razorpay_payment_id}`);
@@ -690,8 +692,9 @@ app.post("/api/razorpay/refund", verifyFirebaseToken, requireOwner, async (req, 
     if (!paymentId || !amount || amount <= 0 || !orderId || !userId) {
       return res.status(400).json({ error: "Missing required parameters or invalid refund amount." });
     }
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const config = getConfig();
+    const keyId = config?.payment?.razorpayKeyId || process.env.RAZORPAY_KEY_ID;
+    const keySecret = config?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
     let refundId;
     if (keyId && keySecret) {
       const basic = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
@@ -977,8 +980,9 @@ app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
     let refundId = null;
     if (isRazorpay && order?.payment?.razorpayPaymentId) {
       try {
-        const keyId = process.env.RAZORPAY_KEY_ID;
-        const keySecret = process.env.RAZORPAY_KEY_SECRET;
+        const config2 = getConfig();
+        const keyId = config2?.payment?.razorpayKeyId || process.env.RAZORPAY_KEY_ID;
+        const keySecret = config2?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
         if (keyId && keySecret) {
           const basic = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
           const rpRes = await fetch(`https://api.razorpay.com/v1/payments/${order.payment.razorpayPaymentId}/refund`, {

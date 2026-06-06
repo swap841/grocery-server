@@ -731,7 +731,8 @@ app.post("/api/razorpay/refund", verifyFirebaseToken, requireOwner, async (req, 
 // 5. POST /api/upload-photo — ImgBB upload proxy
 app.post("/api/upload-photo", upload.single("image"), async (req, res) => {
   try {
-    const apiKey = process.env.IMGBB_API_KEY;
+    const config = getConfig();
+    const apiKey = config?.apiKeys?.imgbb?.key || process.env.IMGBB_API_KEY;
     if (!apiKey) {
       return res.status(500).json({ success: false, error: "ImgBB API key not configured on server" });
     }
@@ -761,7 +762,8 @@ app.post("/api/set-owner", verifyFirebaseToken, requireOwner, async (req, res) =
     if (!uid || !email) {
       return res.status(400).json({ success: false, error: "Missing uid or email" });
     }
-    const allowedEmails = (process.env.ALLOWED_OWNER_EMAILS || "youremail@gmail.com").split(",").map(e => e.trim().toLowerCase());
+    const config = getConfig();
+    const allowedEmails = (config?.workers?.ownerEmails?.join(",") || process.env.ALLOWED_OWNER_EMAILS || "youremail@gmail.com").split(",").map(e => e.trim().toLowerCase());
     if (!allowedEmails.includes(email.toLowerCase())) {
       logger.warn(`Unauthorized owner signup attempt: ${email}`);
       return res.status(403).json({ success: false, error: "You are not authorized to be an owner" });
@@ -783,9 +785,10 @@ app.post("/api/notify-owner", async (req, res) => {
     if (!orderId || !amount || !customerName) {
       return res.status(400).json({ success: false, error: "Missing required fields" });
     }
-    const msg91AuthKey = process.env.MSG91_AUTH_KEY;
-    const msg91FlowId = process.env.MSG91_FLOW_ID;
-    const ownerPhone = process.env.OWNER_PHONE;
+    const config = getConfig();
+    const msg91AuthKey = config?.notifications?.smsApiKey || process.env.MSG91_AUTH_KEY;
+    const msg91FlowId = config?.notifications?.smsFlowId || process.env.MSG91_FLOW_ID;
+    const ownerPhone = config?.contactInfo?.phone || process.env.OWNER_PHONE;
     if (!msg91AuthKey || !msg91FlowId || !ownerPhone) {
       logger.warn("MSG91 not configured, skipping SMS");
       return res.json({ success: true, message: "Notification skipped (MSG91 not configured)", note: "Configure MSG91_AUTH_KEY, MSG91_FLOW_ID, and OWNER_PHONE" });

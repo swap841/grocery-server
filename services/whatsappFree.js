@@ -1,9 +1,11 @@
 const axios = require('axios');
+const { getConfig } = require('./configLoader');
 
 class WhatsAppFreeService {
   constructor() {
-    this.phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-    this.accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    const config = getConfig();
+    this.phoneNumberId = config?.notifications?.whatsAppPhoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID;
+    this.accessToken = config?.notifications?.whatsAppApiKey || process.env.WHATSAPP_ACCESS_TOKEN;
     this.version = 'v18.0';
   }
 

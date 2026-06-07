@@ -770,6 +770,7 @@ app.post("/api/set-owner", verifyFirebaseToken, requireOwner, async (req, res) =
     }
     await admin.auth().setCustomUserClaims(uid, { role: "owner", email, claimsSetAt: new Date().toISOString() });
     await db.collection("users").doc(uid).set({ role: "owner", email, claimsSetAt: new Date().toISOString(), isOwner: true }, { merge: true });
+    await db.collection("owners").doc(uid).set({ email, isOwner: true, createdAt: new Date().toISOString() }, { merge: true });
     logger.info(`Owner claims set for ${email}`);
     return res.json({ success: true, message: `Owner claims set for ${email}` });
   } catch (err) {

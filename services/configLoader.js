@@ -9,8 +9,14 @@ let loadCount = 0;
 
 async function loadConfig() {
   try {
+    // Primary: appConfig/settings (what owner dashboard writes to)
     let snap = await db.collection("appConfig").doc("settings").get();
     if (!snap.exists) {
+      // Fallback: config/appConfig (alternate path)
+      snap = await db.collection("config").doc("appConfig").get();
+    }
+    if (!snap.exists) {
+      // Fallback: appConfig/main (oldest path)
       snap = await db.collection("appConfig").doc("main").get();
     }
     if (snap.exists) {

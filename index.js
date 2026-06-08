@@ -1105,12 +1105,12 @@ app.post("/api/config", verifyFirebaseToken, requireOwner, async (req, res) => {
     if (ai !== undefined) updateData.ai = ai;
     updateData.updatedAt = new Date().toISOString();
 
-    await db.collection("appConfig").doc("main").set(updateData, { merge: true });
-    // Also sync to settings doc if it exists (prefer settings)
-    const settingsRef = db.collection("appConfig").doc("settings");
-    const settingsSnap = await settingsRef.get();
-    if (settingsSnap.exists) {
-      await settingsRef.set(updateData, { merge: true });
+    await db.collection("appConfig").doc("settings").set(updateData, { merge: true });
+    // Also sync to main doc for backward compat
+    const mainRef = db.collection("appConfig").doc("main");
+    const mainSnap = await mainRef.get();
+    if (mainSnap.exists) {
+      await mainRef.set(updateData, { merge: true });
     }
     configCache.del("app_config");
     productCache.flushAll();
@@ -1332,6 +1332,9 @@ process.on("unhandledRejection", (reason) => {
 // ─── Cleanup Note ───
 // TODO: Deploy a Cloud Function (onFirestore or scheduled) to periodically
 // delete expired inventoryLocks documents (where expiresAt < now).
+
+// ─── Export for testing (supertest) ───
+module.exports = app;
 
 // ─── Start ───
 app.listen(PORT, () => {

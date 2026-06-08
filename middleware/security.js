@@ -93,7 +93,7 @@ function inputSanitizer(req, res, next) {
     if (/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/i.test(raw)) {
       return res.status(400).json({ error: "Script tags not allowed" });
     }
-    if (/\$\.|\.\(\s*\)|\beval\s*\(/.test(raw)) {
+    if (/\$\.|\$\s*\(\s*(?:function|\(|\)|[a-zA-Z_$])|\.\(\s*\)|\beval\s*\(/.test(raw)) {
       return res.status(400).json({ error: "Suspicious input detected" });
     }
   } catch (e) {

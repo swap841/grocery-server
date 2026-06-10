@@ -27,9 +27,6 @@ const {
   createOrderSchema,
   createRazorpayOrderSchema,
   verifyPaymentSchema,
-  registerFcmTokenSchema,
-  sendOTPFcmSchema,
-  verifyPhoneFcmSchema,
 } = require("./middleware/validation");
 
 const { logger, morganMiddleware, errorHandler, logErrorToFirestore } = require("./middleware/logging");
@@ -57,7 +54,6 @@ db.settings({ ignoreUndefinedProperties: true });
 
 const NodeCache = require("node-cache");
 const productCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // 5 min TTL
-const otpCache = new NodeCache({ stdTTL: 300, checkperiod: 30 }); // 5 min TTL for OTPs
 
 const { loadConfig: reloadConfig, getConfig } = require("./services/configLoader");
 const { dispatch: dispatchToPartner, track: trackOrder, handleWebhook } = require("./services/deliveryPartner");
@@ -537,8 +533,27 @@ async function incrementDailyStats(amount, isCancelled = false) {
 
 // ─── Migrated Next.js API Routes ───
 
+// ─── Order Rate Limiter ───
+const orderRateLimit = new Map();
+function orderRateLimiter(req, res, next) {
+  const userId = req.body?.userId || req.user?.uid || req.ip;
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const maxOrders = 10;
+  const entry = orderRateLimit.get(userId);
+  if (entry && now < entry.resetTime) {
+    if (entry.count >= maxOrders) {
+      return res.status(429).json({ success: false, error: "Too many orders. Please try again after 1 hour." });
+    }
+    entry.count++;
+  } else {
+    orderRateLimit.set(userId, { count: 1, resetTime: now + windowMs });
+  }
+  next();
+}
+
 // 1. POST /api/orders/create — COD order creation (batch write)
-app.post("/api/orders/create", verifyFirebaseToken, validate(createOrderSchema), async (req, res) => {
+app.post("/api/orders/create", verifyFirebaseToken, orderRateLimiter, validate(createOrderSchema), async (req, res) => {
   try {
     const { userId, orderData, couponCode } = req.validated;
     if (!userId || !orderData) {
@@ -587,6 +602,25 @@ app.post("/api/orders/create", verifyFirebaseToken, validate(createOrderSchema),
       batch.update(couponRef, { usedCount: FieldValue.increment(1) });
     }
 
+    // Check stock availability
+    for (const item of orderData.items || []) {
+      if (item.productId) {
+        try {
+          const productRef = admin.firestore().collection("products").doc(item.productId);
+          const productSnap = await productRef.get();
+          const currentStock = productSnap.data()?.stock || 0;
+          if (currentStock < (item.quantity || 1)) {
+            return res.status(400).json({ 
+              success: false, 
+              error: `Insufficient stock for "${item.name || 'item'}". Only ${currentStock} available.` 
+            });
+          }
+        } catch (e) {
+          // Skip stock check if product doesn't exist
+        }
+      }
+    }
+
     await batch.commit();
     await incrementDailyStats(orderData.totalAmount || 0);
     logger.info(`COD order ${orderId} created for user ${userId}`);
@@ -624,7 +658,7 @@ app.post("/api/razorpay/create-order", verifyFirebaseToken, validate(createRazor
 });
 
 // 3. POST /api/razorpay/verify-payment — Verify signature + create order
-app.post("/api/razorpay/verify-payment", verifyFirebaseToken, validate(verifyPaymentSchema), async (req, res) => {
+app.post("/api/razorpay/verify-payment", verifyFirebaseToken, orderRateLimiter, validate(verifyPaymentSchema), async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, orderData, couponCode } = req.validated;
     const config = getConfig();
@@ -665,6 +699,25 @@ app.post("/api/razorpay/verify-payment", verifyFirebaseToken, validate(verifyPay
         }
       }
     }
+    // Check stock availability
+    for (const item of orderData.items || []) {
+      if (item.productId) {
+        try {
+          const productRef = admin.firestore().collection("products").doc(item.productId);
+          const productSnap = await productRef.get();
+          const currentStock = productSnap.data()?.stock || 0;
+          if (currentStock < (item.quantity || 1)) {
+            return res.status(400).json({ 
+              success: false, 
+              error: `Insufficient stock for "${item.name || 'item'}". Only ${currentStock} available.` 
+            });
+          }
+        } catch (e) {
+          // Skip stock check if product doesn't exist
+        }
+      }
+    }
+
     if (couponCode) {
       writes.push(db.collection("coupons").doc(couponCode.toUpperCase()).update({ usedCount: FieldValue.increment(1) }));
     }
@@ -1378,109 +1431,6 @@ app.get("/api/delivery-zones", async (req, res) => {
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ error: "Failed to fetch delivery zones" });
-  }
-});
-
-// ─── FCM OTP endpoints (for phone verification at checkout) ───
-
-// 4. POST /api/auth/register-fcm-token — Register user's FCM push token
-app.post("/api/auth/register-fcm-token", verifyFirebaseToken, validate(registerFcmTokenSchema), async (req, res) => {
-  try {
-    const { userId, fcmToken, deviceInfo } = req.validated;
-    if (req.user.uid !== userId) {
-      return res.status(403).json({ success: false, error: "userId mismatch" });
-    }
-    await admin.firestore().collection("users").doc(userId).set(
-      { fcmToken, fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(), deviceInfo: deviceInfo || "" },
-      { merge: true }
-    );
-    logger.info(`FCM token registered for user ${userId}`);
-    return res.json({ success: true });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 5. POST /api/auth/send-otp-fcm — Send OTP via FCM push, fallback to SMS
-app.post("/api/auth/send-otp-fcm", verifyFirebaseToken, validate(sendOTPFcmSchema), async (req, res) => {
-  try {
-    const { userId, phoneNumber } = req.validated;
-    if (req.user.uid !== userId) {
-      return res.status(403).json({ success: false, error: "userId mismatch" });
-    }
-    const rateKey = `fcm_otp_rate_${userId}`;
-    const rateRecord = otpCache.get(rateKey);
-    if (rateRecord && rateRecord.count >= 3) {
-      return res.status(429).json({ success: false, error: "Too many OTP requests. Try again later." });
-    }
-    const otp = Math.floor(1000 + Math.random() * 9000).toString();
-    const cacheKey = `fcm_otp_${userId}_${phoneNumber}`;
-    otpCache.set(cacheKey, { otp, attempts: 0, expiresAt: Date.now() + 300000 }, 600);
-    if (rateRecord) { rateRecord.count++; otpCache.set(rateKey, rateRecord, 3600); }
-    else { otpCache.set(rateKey, { count: 1 }, 3600); }
-
-    const userDoc = await admin.firestore().collection("users").doc(userId).get();
-    const fcmToken = userDoc.data()?.fcmToken;
-    if (!fcmToken) {
-      otpCache.del(cacheKey);
-      return res.status(502).json({ success: false, error: "No FCM token registered. Please enable notifications." });
-    }
-    try {
-      await admin.messaging().send({
-        token: fcmToken,
-        notification: { title: `Your OTP is ${otp}`, body: `Use ${otp} to verify your phone. Valid 5 min.` },
-        data: { type: "otp_verification", otp, phoneNumber },
-      });
-      logger.info(`OTP sent via FCM to user ${userId}`);
-      return res.json({ success: true, channel: "fcm" });
-    } catch (fcmErr) {
-      otpCache.del(cacheKey);
-      logger.warn(`FCM send failed for ${userId}: ${fcmErr.message}`);
-      return res.status(502).json({ success: false, error: "Failed to send OTP via FCM." });
-    }
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 6. POST /api/auth/verify-phone-fcm — Verify OTP received via FCM
-app.post("/api/auth/verify-phone-fcm", verifyFirebaseToken, validate(verifyPhoneFcmSchema), async (req, res) => {
-  try {
-    const { userId, phoneNumber, otp } = req.validated;
-    if (req.user.uid !== userId) {
-      return res.status(403).json({ success: false, error: "userId mismatch" });
-    }
-    const cacheKey = `fcm_otp_${userId}_${phoneNumber}`;
-    const record = otpCache.get(cacheKey);
-    if (!record) {
-      return res.status(400).json({ success: false, error: "OTP expired or not sent." });
-    }
-    if (Date.now() > record.expiresAt) {
-      otpCache.del(cacheKey);
-      return res.status(400).json({ success: false, error: "OTP expired." });
-    }
-    if (record.attempts >= 3) {
-      otpCache.del(cacheKey);
-      return res.status(400).json({ success: false, error: "Too many wrong attempts. Request new OTP." });
-    }
-    if (record.otp !== otp) {
-      record.attempts++;
-      otpCache.set(cacheKey, record);
-      const remaining = 3 - record.attempts;
-      return res.status(400).json({ success: false, error: `Invalid OTP. ${remaining} attempt${remaining !== 1 ? "s" : ""} remaining.` });
-    }
-    otpCache.del(cacheKey);
-    await admin.firestore().collection("users").doc(userId).set(
-      { phoneVerified: true, phoneNumber, phoneVerifiedAt: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-    logger.info(`Phone ${phoneNumber} verified via FCM OTP for user ${userId}`);
-    return res.json({ success: true, phoneNumber });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
   }
 });
 

@@ -142,29 +142,6 @@ function validate(schema) {
   };
 }
 
-const registerFcmTokenSchema = z.object({
-  body: z.object({
-    userId: z.string().min(1),
-    fcmToken: z.string().min(20),
-    deviceInfo: z.string().optional(),
-  }),
-});
-
-const sendOTPFcmSchema = z.object({
-  body: z.object({
-    userId: z.string().min(1),
-    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number" }),
-  }),
-});
-
-const verifyPhoneFcmSchema = z.object({
-  body: z.object({
-    userId: z.string().min(1),
-    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number" }),
-    otp: z.string().length(4, "OTP must be 4 digits"),
-  }),
-});
-
 module.exports = {
   validate,
   verifyDeliveryCodeSchema,
@@ -174,7 +151,4 @@ module.exports = {
   createOrderSchema,
   createRazorpayOrderSchema,
   verifyPaymentSchema,
-  registerFcmTokenSchema,
-  sendOTPFcmSchema,
-  verifyPhoneFcmSchema,
 };

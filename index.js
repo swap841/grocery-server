@@ -25,6 +25,16 @@ const {
   thirdPartyWebhookSchema,
   paySalarySchema,
   sendSMSOTPSchema,
+  createOrderSchema,
+  createRazorpayOrderSchema,
+  verifyPaymentSchema,
+  sendPhoneOTPSchema,
+  verifyPhoneOTPSchema,
+  linkPhoneToGoogleSchema,
+  sendSMSNotificationSchema,
+  registerFcmTokenSchema,
+  sendOTPFcmSchema,
+  verifyPhoneFcmSchema,
 } = require("./middleware/validation");
 
 const { logger, morganMiddleware, errorHandler, logErrorToFirestore } = require("./middleware/logging");
@@ -52,9 +62,13 @@ db.settings({ ignoreUndefinedProperties: true });
 
 const NodeCache = require("node-cache");
 const productCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // 5 min TTL
+const otpCache = new NodeCache({ stdTTL: 300, checkperiod: 30 }); // 5 min TTL for OTPs
+const otpRateCache = new NodeCache({ stdTTL: 3600, checkperiod: 60 }); // 1 hour rate limit window
 
 const { loadConfig: reloadConfig, getConfig } = require("./services/configLoader");
 const { dispatch: dispatchToPartner, track: trackOrder, handleWebhook } = require("./services/deliveryPartner");
+const { sendOTP, sendNotification } = require("./services/smsGateway");
+const { validatePincode } = require("./services/pincodeValidator");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -540,9 +554,9 @@ async function incrementDailyStats(amount, isCancelled = false) {
 // ─── Migrated Next.js API Routes ───
 
 // 1. POST /api/orders/create — COD order creation (batch write)
-app.post("/api/orders/create", verifyFirebaseToken, async (req, res) => {
+app.post("/api/orders/create", verifyFirebaseToken, validate(createOrderSchema), async (req, res) => {
   try {
-    const { userId, orderData, couponCode } = req.body;
+    const { userId, orderData, couponCode } = req.validated;
     if (!userId || !orderData) {
       return res.status(400).json({ success: false, error: "Missing user or order data" });
     }
@@ -600,12 +614,9 @@ app.post("/api/orders/create", verifyFirebaseToken, async (req, res) => {
 });
 
 // 2. POST /api/razorpay/create-order — Create Razorpay order
-app.post("/api/razorpay/create-order", verifyFirebaseToken, async (req, res) => {
+app.post("/api/razorpay/create-order", verifyFirebaseToken, validate(createRazorpayOrderSchema), async (req, res) => {
   try {
-    const { amount, receipt } = req.body;
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: "Invalid amount. Must be greater than 0." });
-    }
+    const { amount, receipt } = req.validated;
     const config = getConfig();
     const keyId = config?.payment?.razorpayKeyId || process.env.RAZORPAY_KEY_ID;
     const keySecret = config?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
@@ -629,12 +640,9 @@ app.post("/api/razorpay/create-order", verifyFirebaseToken, async (req, res) => 
 });
 
 // 3. POST /api/razorpay/verify-payment — Verify signature + create order
-app.post("/api/razorpay/verify-payment", verifyFirebaseToken, async (req, res) => {
+app.post("/api/razorpay/verify-payment", verifyFirebaseToken, validate(verifyPaymentSchema), async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, orderData, couponCode } = req.body;
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({ success: false, error: "Missing required payment parameters" });
-    }
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, orderData, couponCode } = req.validated;
     const config = getConfig();
     const secret = config?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
     if (secret) {
@@ -1291,6 +1299,7 @@ app.get("/api/app-config", async (req, res) => {
       delete safeConfig.notifications.whatsAppApiKey;
       delete safeConfig.notifications.smsApiKey;
       delete safeConfig.notifications.smsProviderApiKey;
+      delete safeConfig.notifications.smsGatewayApiKey;
     }
     if (safeConfig.delivery?.partners) {
       safeConfig.delivery = { ...safeConfig.delivery };
@@ -1302,6 +1311,317 @@ app.get("/api/app-config", async (req, res) => {
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message || "Failed to fetch config" });
+  }
+});
+
+// ─── SMS Auth Endpoints ───
+
+// 1. POST /api/auth/send-phone-otp — Generate and send OTP via SMS gateway
+app.post("/api/auth/send-phone-otp", validate(sendPhoneOTPSchema), async (req, res) => {
+  try {
+    const { phoneNumber } = req.validated;
+    const rateKey = `rate_${phoneNumber}`;
+    const rateData = otpRateCache.get(rateKey) || 0;
+    if (rateData >= 3) {
+      return res.status(429).json({ success: false, error: "Too many OTP requests. Try again later." });
+    }
+    otpRateCache.set(rateKey, rateData + 1);
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const existing = otpCache.get(phoneNumber);
+    if (existing && existing.attempts >= 3) {
+      return res.status(429).json({ success: false, error: "Too many attempts. Request a new OTP." });
+    }
+    otpCache.set(phoneNumber, { otp, phoneNumber, attempts: 0, createdAt: Date.now() });
+    const result = await sendOTP(phoneNumber, otp);
+    if (!result.success && !result.simulated) {
+      return res.status(502).json({ success: false, error: "Failed to send SMS. Try again." });
+    }
+    logger.info(`OTP ${result.simulated ? "(simulated) " : ""}sent to ${phoneNumber}`);
+    return res.json({ success: true, simulated: !!result.simulated, message: "OTP sent" });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. POST /api/auth/verify-phone-otp — Verify OTP and return custom token or link prompt
+app.post("/api/auth/verify-phone-otp", validate(verifyPhoneOTPSchema), async (req, res) => {
+  try {
+    const { phoneNumber, otp } = req.validated;
+    const record = otpCache.get(phoneNumber);
+    if (!record) {
+      return res.status(400).json({ success: false, error: "No OTP requested for this number. Request a new OTP." });
+    }
+    record.attempts = (record.attempts || 0) + 1;
+    otpCache.set(phoneNumber, record);
+    if (record.attempts > 3) {
+      otpCache.del(phoneNumber);
+      return res.status(429).json({ success: false, error: "Too many incorrect attempts. Request a new OTP." });
+    }
+    if (record.otp !== otp) {
+      const remaining = 3 - record.attempts;
+      return res.status(400).json({ success: false, error: `Invalid OTP. ${remaining} attempt${remaining !== 1 ? "s" : ""} remaining.` });
+    }
+    otpCache.del(phoneNumber);
+    const phoneDoc = await db.collection("phoneLinks").doc(phoneNumber).get();
+    if (phoneDoc.exists && phoneDoc.data().isActive !== false && phoneDoc.data().googleUid) {
+      const { googleUid, googleEmail } = phoneDoc.data();
+      const customToken = await admin.auth().createCustomToken(googleUid);
+      try {
+        await admin.auth().updateUser(googleUid, { phoneNumber });
+      } catch (_) {}
+      await phoneDoc.ref.update({ lastUsedAt: admin.firestore.FieldValue.serverTimestamp() });
+      return res.json({ success: true, linked: true, customToken, googleUid, googleEmail });
+    }
+    return res.json({ success: true, linked: false, phoneNumber, message: "Phone verified. Link with Google to continue." });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 3. POST /api/auth/link-phone-to-google — Link phone number to Google account
+app.post("/api/auth/link-phone-to-google", verifyFirebaseToken, validate(linkPhoneToGoogleSchema), async (req, res) => {
+  try {
+    const { phoneNumber, googleUid, googleEmail } = req.validated;
+    const authUid = req.user?.uid || req.validated.googleUid;
+    if (authUid !== googleUid) {
+      return res.status(403).json({ success: false, error: "googleUid does not match authenticated user" });
+    }
+    const phoneDocRef = db.collection("phoneLinks").doc(phoneNumber);
+    await phoneDocRef.set({
+      googleUid,
+      googleEmail: googleEmail || "",
+      linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
+      isActive: true,
+    }, { merge: true });
+    try {
+      await admin.auth().updateUser(googleUid, { phoneNumber });
+    } catch (_) {}
+    const customToken = await admin.auth().createCustomToken(googleUid);
+    return res.json({ success: true, customToken, googleUid, message: "Phone linked successfully" });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 4. POST /api/auth/send-sms-notification — Send arbitrary SMS (ticket alerts, delivery updates, sale offers)
+app.post("/api/auth/send-sms-notification", apiKeyAuth, validate(sendSMSNotificationSchema), async (req, res) => {
+  try {
+    const { phoneNumber, message } = req.validated;
+    const result = await sendNotification(phoneNumber, message);
+    if (!result.success && !result.simulated) {
+      return res.status(502).json({ success: false, error: "Failed to send SMS." });
+    }
+    return res.json({ success: true, simulated: !!result.simulated, message: "SMS sent" });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── Delivery Location Endpoints ───
+
+app.post("/api/validate-pincode", async (req, res) => {
+  try {
+    const { pincode } = req.body;
+    if (!pincode || !/^\d{6}$/.test(pincode)) {
+      return res.status(400).json({ valid: false, error: "Pincode must be 6 digits", pincode });
+    }
+    const result = await validatePincode(pincode);
+    return res.json(result);
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ valid: false, error: "Failed to validate pincode", pincode: req.body?.pincode });
+  }
+});
+
+app.post("/api/validate-location", async (req, res) => {
+  try {
+    const { lat, lng } = req.body;
+    if (typeof lat !== "number" || typeof lng !== "number" || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({ valid: false, error: "Invalid coordinates" });
+    }
+    const config = getConfig();
+    const storeLat = config?.store?.location?.lat ?? 17.6868;
+    const storeLng = config?.store?.location?.lng ?? 74.0066;
+    const maxKm = config?.deliveryZones?.enabled ? 50 : 20;
+
+    const R = 6371;
+    const dLat = ((lat - storeLat) * Math.PI) / 180;
+    const dLng = ((lng - storeLng) * Math.PI) / 180;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos((storeLat * Math.PI) / 180) * Math.cos((lat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distanceKm = Math.round(R * c * 10) / 10;
+
+    const isThirdParty = distanceKm > maxKm;
+    let estimatedHours = 1;
+    if (isThirdParty) {
+      estimatedHours = Math.max(24, Math.ceil(distanceKm / 40) * 8);
+    } else if (distanceKm <= 5) {
+      estimatedHours = 1;
+    } else if (distanceKm <= 10) {
+      estimatedHours = 2;
+    } else {
+      estimatedHours = Math.ceil(distanceKm / 10);
+    }
+
+    let partition = "zone_0_10";
+    if (distanceKm > 10) partition = "zone_10_20";
+    if (distanceKm > 20) partition = "zone_20_30";
+    if (distanceKm > 30) partition = "zone_30_50";
+    if (distanceKm > 50) partition = "zone_50_plus";
+
+    return res.json({
+      valid: true,
+      distanceKm,
+      isThirdParty,
+      deliveryType: isThirdParty ? "thirdParty" : "own",
+      partition,
+      estimatedHours,
+      maxKm,
+    });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ valid: false, error: "Failed to validate location" });
+  }
+});
+
+app.get("/api/delivery-zones", async (req, res) => {
+  try {
+    const config = getConfig();
+    const zones = config?.deliveryZones || {};
+    return res.json({
+      enabled: zones.enabled ?? true,
+      localPincodes: zones.localPincodes || [],
+      deliveryCharges: zones.deliveryCharges || {},
+      freeDeliveryThresholds: zones.freeDeliveryThresholds || {},
+      maxLocalWeightKg: zones.maxLocalWeightKg || 25,
+    });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ error: "Failed to fetch delivery zones" });
+  }
+});
+
+// ─── FCM OTP endpoints (for phone verification at checkout) ───
+
+// 4. POST /api/auth/register-fcm-token — Register user's FCM push token
+app.post("/api/auth/register-fcm-token", verifyFirebaseToken, validate(registerFcmTokenSchema), async (req, res) => {
+  try {
+    const { userId, fcmToken, deviceInfo } = req.validated;
+    if (req.user.uid !== userId) {
+      return res.status(403).json({ success: false, error: "userId mismatch" });
+    }
+    await admin.firestore().collection("users").doc(userId).set(
+      { fcmToken, fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(), deviceInfo: deviceInfo || "" },
+      { merge: true }
+    );
+    logger.info(`FCM token registered for user ${userId}`);
+    return res.json({ success: true });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 5. POST /api/auth/send-otp-fcm — Send OTP via FCM push, fallback to SMS
+app.post("/api/auth/send-otp-fcm", verifyFirebaseToken, validate(sendOTPFcmSchema), async (req, res) => {
+  try {
+    const { userId, phoneNumber } = req.validated;
+    if (req.user.uid !== userId) {
+      return res.status(403).json({ success: false, error: "userId mismatch" });
+    }
+    const rateKey = `fcm_otp_rate_${userId}`;
+    const rateRecord = otpCache.get(rateKey);
+    if (rateRecord && rateRecord.count >= 3) {
+      return res.status(429).json({ success: false, error: "Too many OTP requests. Try again later." });
+    }
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const cacheKey = `fcm_otp_${userId}_${phoneNumber}`;
+    otpCache.set(cacheKey, { otp, attempts: 0, expiresAt: Date.now() + 300000 }, 600);
+    if (rateRecord) { rateRecord.count++; otpCache.set(rateKey, rateRecord, 3600); }
+    else { otpCache.set(rateKey, { count: 1 }, 3600); }
+
+    // Try FCM push first
+    const userDoc = await admin.firestore().collection("users").doc(userId).get();
+    const fcmToken = userDoc.data()?.fcmToken;
+    let sentViaFcm = false;
+    if (fcmToken) {
+      try {
+        await admin.messaging().send({
+          token: fcmToken,
+          notification: { title: `Your OTP is ${otp}`, body: `Use ${otp} to verify your phone. Valid 5 min.` },
+          data: { type: "otp_verification", otp, phoneNumber },
+        });
+        sentViaFcm = true;
+        logger.info(`OTP sent via FCM to user ${userId}`);
+      } catch (fcmErr) {
+        logger.warn(`FCM send failed for ${userId}: ${fcmErr.message}`);
+      }
+    }
+
+    // If FCM failed, inform client to use SMS fallback
+    if (!sentViaFcm) {
+      const smsResult = await require("./services/smsGateway").sendOTP(phoneNumber, otp);
+      if (smsResult.simulated) {
+        // Gateway not configured — log OTP for dev
+        logger.info(`[DEV] OTP for ${phoneNumber}: ${otp}`);
+        return res.json({ success: true, channel: "simulated", message: "Check server logs for OTP (SMS gateway not configured)" });
+      }
+      if (!smsResult.success) {
+        otpCache.del(cacheKey);
+        return res.status(502).json({ success: false, error: "Failed to send OTP. Enable notifications or configure SMS gateway." });
+      }
+      logger.info(`OTP sent via SMS fallback to ${phoneNumber}`);
+      return res.json({ success: true, channel: "sms" });
+    }
+
+    return res.json({ success: true, channel: "fcm" });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 6. POST /api/auth/verify-phone-fcm — Verify OTP received via FCM
+app.post("/api/auth/verify-phone-fcm", verifyFirebaseToken, validate(verifyPhoneFcmSchema), async (req, res) => {
+  try {
+    const { userId, phoneNumber, otp } = req.validated;
+    if (req.user.uid !== userId) {
+      return res.status(403).json({ success: false, error: "userId mismatch" });
+    }
+    const cacheKey = `fcm_otp_${userId}_${phoneNumber}`;
+    const record = otpCache.get(cacheKey);
+    if (!record) {
+      return res.status(400).json({ success: false, error: "OTP expired or not sent." });
+    }
+    if (Date.now() > record.expiresAt) {
+      otpCache.del(cacheKey);
+      return res.status(400).json({ success: false, error: "OTP expired." });
+    }
+    if (record.attempts >= 3) {
+      otpCache.del(cacheKey);
+      return res.status(400).json({ success: false, error: "Too many wrong attempts. Request new OTP." });
+    }
+    if (record.otp !== otp) {
+      record.attempts++;
+      otpCache.set(cacheKey, record);
+      const remaining = 3 - record.attempts;
+      return res.status(400).json({ success: false, error: `Invalid OTP. ${remaining} attempt${remaining !== 1 ? "s" : ""} remaining.` });
+    }
+    otpCache.del(cacheKey);
+    await admin.firestore().collection("users").doc(userId).set(
+      { phoneVerified: true, phoneNumber, phoneVerifiedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    logger.info(`Phone ${phoneNumber} verified via FCM OTP for user ${userId}`);
+    return res.json({ success: true, phoneNumber });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 

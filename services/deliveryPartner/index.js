@@ -50,4 +50,10 @@ registerProvider("shiprocket", shiprocket);
 const dunzo = require("./dunzo");
 registerProvider("dunzo", dunzo);
 
+const delhivery = require("./delhivery");
+registerProvider("delhivery", delhivery);
+
+const shadowfax = require("./shadowfax");
+registerProvider("shadowfax", shadowfax);
+
 module.exports = { registerProvider, dispatch, track, handleWebhook, providers };

@@ -1,5 +1,13 @@
 const { z } = require("zod");
 
+function isIndianPhoneValid(phone) {
+  const num = phone.replace("+91", "");
+  if (num.length !== 10) return false;
+  if (!/^[6-9]/.test(num)) return false;
+  if (/^(\d)\1{9}$/.test(num)) return false;
+  return true;
+}
+
 const verifyDeliveryCodeSchema = z.object({
   body: z.object({
     orderId: z.string().min(1, "orderId is required"),
@@ -39,6 +47,117 @@ const sendSMSOTPSchema = z.object({
   }),
 });
 
+const sendPhoneOTPSchema = z.object({
+  body: z.object({
+    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
+  }),
+});
+
+const verifyPhoneOTPSchema = z.object({
+  body: z.object({
+    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
+    otp: z.string().length(6, "OTP must be 6 digits"),
+  }),
+});
+
+const linkPhoneToGoogleSchema = z.object({
+  body: z.object({
+    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
+    googleUid: z.string().min(1, "googleUid is required"),
+    googleEmail: z.string().email("Invalid email").optional(),
+  }),
+});
+
+const sendSMSNotificationSchema = z.object({
+  body: z.object({
+    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
+    message: z.string().min(1, "Message is required").max(500, "Message too long"),
+  }),
+});
+
+const orderItemSchema = z.object({
+  productId: z.string().min(1),
+  name: z.string().min(1),
+  quantity: z.number().int().positive(),
+  price: z.number().nonnegative(),
+  weight: z.number().nonnegative().optional(),
+  imageUrl: z.string().optional(),
+});
+
+const deliveryLocationSchema = z.object({
+  lat: z.number(),
+  lng: z.number(),
+  geoHash: z.string().optional(),
+  distanceKm: z.number().optional(),
+  partition: z.string().optional(),
+  deliveryType: z.enum(["own", "thirdParty"]).optional(),
+}).nullable().optional();
+
+const createOrderSchema = z.object({
+  body: z.object({
+    userId: z.string().min(1, "userId is required"),
+    orderData: z.object({
+      userName: z.string().min(2, "Name must be at least 2 characters"),
+      userPhone: z.string().regex(/^\d{10}$/, "Phone must be a 10-digit number"),
+      userEmail: z.string().email("Invalid email").optional().or(z.literal("")),
+      items: z.array(orderItemSchema).min(1, "At least one item is required"),
+      address: z.object({
+        name: z.string().min(2, "Name must be at least 2 characters"),
+        phone: z.string().regex(/^\d{10}$/, "Phone must be a 10-digit number"),
+        addressLine: z.string().min(5, "Address must be at least 5 characters"),
+        pincode: z.string().regex(/^\d{6}$/, "Pincode must be a 6-digit number"),
+        city: z.string().optional(),
+        lat: z.number().nullable().optional(),
+        lng: z.number().nullable().optional(),
+      }).optional(),
+      deliveryLocation: deliveryLocationSchema,
+      totalAmount: z.number().nonnegative(),
+      subtotal: z.number().nonnegative().optional(),
+      deliveryCharge: z.number().nonnegative().optional(),
+      taxAmount: z.number().nonnegative().optional(),
+      totalWeight: z.number().nonnegative().optional(),
+      areaCode: z.string().optional(),
+      outOfCity: z.boolean().optional(),
+    }),
+    couponCode: z.string().optional(),
+  }),
+});
+
+const createRazorpayOrderSchema = z.object({
+  body: z.object({
+    amount: z.number().positive("Amount must be greater than 0"),
+    receipt: z.string().optional(),
+  }),
+});
+
+const verifyPaymentSchema = z.object({
+  body: z.object({
+    razorpay_order_id: z.string().min(1),
+    razorpay_payment_id: z.string().min(1),
+    razorpay_signature: z.string().min(1),
+    userId: z.string().min(1),
+    orderData: z.object({
+      userName: z.string().min(2),
+      userPhone: z.string().regex(/^\d{10}$/),
+      userEmail: z.string().email().optional().or(z.literal("")),
+      items: z.array(orderItemSchema).min(1),
+      address: z.object({
+        name: z.string().min(2),
+        phone: z.string().regex(/^\d{10}$/),
+        addressLine: z.string().min(5),
+        pincode: z.string().regex(/^\d{6}$/),
+        city: z.string().optional(),
+        lat: z.number().nullable().optional(),
+        lng: z.number().nullable().optional(),
+      }).optional(),
+      deliveryLocation: deliveryLocationSchema,
+      totalAmount: z.number().nonnegative(),
+      subtotal: z.number().nonnegative().optional(),
+    }),
+    couponCode: z.string().optional(),
+  }),
+});
+
 function validate(schema) {
   return (req, res, next) => {
     const result = schema.safeParse({
@@ -58,6 +177,29 @@ function validate(schema) {
   };
 }
 
+const registerFcmTokenSchema = z.object({
+  body: z.object({
+    userId: z.string().min(1),
+    fcmToken: z.string().min(20),
+    deviceInfo: z.string().optional(),
+  }),
+});
+
+const sendOTPFcmSchema = z.object({
+  body: z.object({
+    userId: z.string().min(1),
+    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number" }),
+  }),
+});
+
+const verifyPhoneFcmSchema = z.object({
+  body: z.object({
+    userId: z.string().min(1),
+    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number" }),
+    otp: z.string().length(6, "OTP must be 6 digits"),
+  }),
+});
+
 module.exports = {
   validate,
   verifyDeliveryCodeSchema,
@@ -65,4 +207,14 @@ module.exports = {
   thirdPartyWebhookSchema,
   paySalarySchema,
   sendSMSOTPSchema,
+  createOrderSchema,
+  createRazorpayOrderSchema,
+  verifyPaymentSchema,
+  sendPhoneOTPSchema,
+  verifyPhoneOTPSchema,
+  linkPhoneToGoogleSchema,
+  sendSMSNotificationSchema,
+  registerFcmTokenSchema,
+  sendOTPFcmSchema,
+  verifyPhoneFcmSchema,
 };

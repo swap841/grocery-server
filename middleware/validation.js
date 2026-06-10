@@ -123,6 +123,21 @@ const verifyPaymentSchema = z.object({
   }),
 });
 
+const sendOTPFcmSchema = z.object({
+  body: z.object({
+    phoneNumber: z.string().regex(/^[6-9]\d{9}$/, "Invalid Indian phone number"),
+    userId: z.string().min(1),
+  }),
+});
+
+const verifyOTPSchema = z.object({
+  body: z.object({
+    phoneNumber: z.string().regex(/^[6-9]\d{9}$/, "Invalid Indian phone number"),
+    otp: z.string().length(4, "OTP must be 4 digits"),
+    userId: z.string().min(1),
+  }),
+});
+
 function validate(schema) {
   return (req, res, next) => {
     const result = schema.safeParse({
@@ -151,4 +166,6 @@ module.exports = {
   createOrderSchema,
   createRazorpayOrderSchema,
   verifyPaymentSchema,
+  sendOTPFcmSchema,
+  verifyOTPSchema,
 };

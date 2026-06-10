@@ -27,6 +27,8 @@ const {
   createOrderSchema,
   createRazorpayOrderSchema,
   verifyPaymentSchema,
+  sendOTPFcmSchema,
+  verifyOTPSchema,
 } = require("./middleware/validation");
 
 const { logger, morganMiddleware, errorHandler, logErrorToFirestore } = require("./middleware/logging");
@@ -54,6 +56,27 @@ db.settings({ ignoreUndefinedProperties: true });
 
 const NodeCache = require("node-cache");
 const productCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // 5 min TTL
+
+const otpCache = new Map(); // key: phoneNumber, value: { code, userId, expiresAt, attempts }
+const OTP_TTL = 5 * 60 * 1000; // 5 minutes
+const OTP_MAX_ATTEMPTS = 3;
+const OTP_LENGTH = 4;
+
+function generateOTP() {
+  let code = "";
+  for (let i = 0; i < OTP_LENGTH; i++) {
+    code += Math.floor(Math.random() * 10).toString();
+  }
+  return code;
+}
+
+function cleanExpiredOTPs() {
+  const now = Date.now();
+  for (const [phone, data] of otpCache) {
+    if (now > data.expiresAt) otpCache.delete(phone);
+  }
+}
+setInterval(cleanExpiredOTPs, 60000);
 
 const { loadConfig: reloadConfig, getConfig } = require("./services/configLoader");
 const { dispatch: dispatchToPartner, track: trackOrder, handleWebhook } = require("./services/deliveryPartner");
@@ -993,6 +1016,160 @@ app.get("/api/fcm/status", apiKeyAuth, async (req, res) => {
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message || "Failed to get FCM status" });
+  }
+});
+
+// ─── Auth: FCM OTP Endpoints ───
+app.post("/api/auth/send-otp-fcm", validate(sendOTPFcmSchema), async (req, res) => {
+  try {
+    const { phoneNumber, userId } = req.body;
+    
+    const phone = phoneNumber.replace(/\s/g, "");
+    
+    // Get user's FCM token from Firestore
+    const fcmTokenDoc = await admin.firestore()
+      .collection("fcmTokens")
+      .doc(userId)
+      .get();
+    
+    if (!fcmTokenDoc.exists) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "FCM token not registered. Please allow notifications and try again.",
+        code: "NO_FCM_TOKEN"
+      });
+    }
+    
+    const { token: fcmToken } = fcmTokenDoc.data();
+    if (!fcmToken) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "FCM token not found. Please allow notifications and try again.",
+        code: "NO_FCM_TOKEN"
+      });
+    }
+    
+    // Generate OTP
+    const code = generateOTP();
+    otpCache.set(phone, {
+      code,
+      userId,
+      expiresAt: Date.now() + OTP_TTL,
+      attempts: 0,
+    });
+    
+    // Send OTP via FCM data message
+    const message = {
+      token: fcmToken,
+      data: {
+        type: "OTP_VERIFICATION",
+        otp: code,
+        title: "Your verification code",
+        body: `Your OTP is ${code}. Do not share this code with anyone.`,
+      },
+      android: {
+        priority: "high",
+      },
+    };
+    
+    try {
+      await admin.messaging().send(message);
+      console.log(`[OTP] Sent to ${phone} for user ${userId}`);
+    } catch (fcmError) {
+      console.error("[OTP] FCM send failed:", fcmError.message);
+      return res.status(400).json({ 
+        success: false, 
+        error: "Failed to send OTP. Please check notification permissions or try again.",
+        code: "FCM_FAILED",
+        details: fcmError.message
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      message: "OTP sent successfully",
+      expiresIn: OTP_TTL / 1000,
+    });
+    
+  } catch (error) {
+    console.error("[OTP] Send error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to send OTP" });
+  }
+});
+
+app.post("/api/auth/verify-otp", validate(verifyOTPSchema), async (req, res) => {
+  try {
+    const { phoneNumber, otp, userId } = req.body;
+    
+    const phone = phoneNumber.replace(/\s/g, "");
+    const entry = otpCache.get(phone);
+    
+    if (!entry) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "OTP expired or not found. Please request a new OTP.",
+        code: "OTP_NOT_FOUND"
+      });
+    }
+    
+    if (Date.now() > entry.expiresAt) {
+      otpCache.delete(phone);
+      return res.status(400).json({ 
+        success: false, 
+        error: "OTP expired. Please request a new OTP.",
+        code: "OTP_EXPIRED"
+      });
+    }
+    
+    if (entry.userId !== userId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "OTP was sent to a different account.",
+        code: "USER_MISMATCH"
+      });
+    }
+    
+    entry.attempts++;
+    
+    if (entry.attempts > OTP_MAX_ATTEMPTS) {
+      otpCache.delete(phone);
+      return res.status(400).json({ 
+        success: false, 
+        error: "Too many attempts. Please request a new OTP.",
+        code: "MAX_ATTEMPTS"
+      });
+    }
+    
+    if (entry.code !== otp.trim()) {
+      const remaining = OTP_MAX_ATTEMPTS - entry.attempts;
+      return res.status(400).json({ 
+        success: false, 
+        error: `Wrong OTP. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`,
+        code: "OTP_INCORRECT",
+        attemptsRemaining: remaining
+      });
+    }
+    
+    // OTP verified - delete from cache
+    otpCache.delete(phone);
+    
+    // Store verified phone in Firestore
+    await admin.firestore().collection("users").doc(userId).set({
+      phone: phone,
+      phoneVerified: true,
+      phoneVerifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    
+    console.log(`[OTP] Verified for ${phone}, user ${userId}`);
+    
+    res.json({ 
+      success: true, 
+      message: "Phone number verified successfully",
+    });
+    
+  } catch (error) {
+    console.error("[OTP] Verify error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to verify OTP" });
   }
 });
 

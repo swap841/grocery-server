@@ -11,7 +11,7 @@ function isIndianPhoneValid(phone) {
 const verifyDeliveryCodeSchema = z.object({
   body: z.object({
     orderId: z.string().min(1, "orderId is required"),
-    code: z.string().length(6, "Code must be 6 digits"),
+    code: z.string().length(4, "Code must be 4 digits"),
   }),
 });
 
@@ -37,41 +37,6 @@ const paySalarySchema = z.object({
     amount: z.number().positive(),
     monthYear: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
     mode: z.enum(["cash", "bank", "UPI"]),
-  }),
-});
-
-const sendSMSOTPSchema = z.object({
-  body: z.object({
-    phoneNumber: z.string().regex(/^\+?\d{10,15}$/),
-    otp: z.string().length(6),
-  }),
-});
-
-const sendPhoneOTPSchema = z.object({
-  body: z.object({
-    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
-  }),
-});
-
-const verifyPhoneOTPSchema = z.object({
-  body: z.object({
-    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
-    otp: z.string().length(6, "OTP must be 6 digits"),
-  }),
-});
-
-const linkPhoneToGoogleSchema = z.object({
-  body: z.object({
-    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
-    googleUid: z.string().min(1, "googleUid is required"),
-    googleEmail: z.string().email("Invalid email").optional(),
-  }),
-});
-
-const sendSMSNotificationSchema = z.object({
-  body: z.object({
-    phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number (starts with 6-9, 10 digits)" }),
-    message: z.string().min(1, "Message is required").max(500, "Message too long"),
   }),
 });
 
@@ -196,7 +161,7 @@ const verifyPhoneFcmSchema = z.object({
   body: z.object({
     userId: z.string().min(1),
     phoneNumber: z.string().refine(isIndianPhoneValid, { message: "Enter a valid Indian mobile number" }),
-    otp: z.string().length(6, "OTP must be 6 digits"),
+    otp: z.string().length(4, "OTP must be 4 digits"),
   }),
 });
 
@@ -206,14 +171,9 @@ module.exports = {
   dispatchToThirdPartySchema,
   thirdPartyWebhookSchema,
   paySalarySchema,
-  sendSMSOTPSchema,
   createOrderSchema,
   createRazorpayOrderSchema,
   verifyPaymentSchema,
-  sendPhoneOTPSchema,
-  verifyPhoneOTPSchema,
-  linkPhoneToGoogleSchema,
-  sendSMSNotificationSchema,
   registerFcmTokenSchema,
   sendOTPFcmSchema,
   verifyPhoneFcmSchema,

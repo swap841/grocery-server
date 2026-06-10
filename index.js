@@ -24,14 +24,9 @@ const {
   dispatchToThirdPartySchema,
   thirdPartyWebhookSchema,
   paySalarySchema,
-  sendSMSOTPSchema,
   createOrderSchema,
   createRazorpayOrderSchema,
   verifyPaymentSchema,
-  sendPhoneOTPSchema,
-  verifyPhoneOTPSchema,
-  linkPhoneToGoogleSchema,
-  sendSMSNotificationSchema,
   registerFcmTokenSchema,
   sendOTPFcmSchema,
   verifyPhoneFcmSchema,
@@ -63,11 +58,9 @@ db.settings({ ignoreUndefinedProperties: true });
 const NodeCache = require("node-cache");
 const productCache = new NodeCache({ stdTTL: 300, checkperiod: 60 }); // 5 min TTL
 const otpCache = new NodeCache({ stdTTL: 300, checkperiod: 30 }); // 5 min TTL for OTPs
-const otpRateCache = new NodeCache({ stdTTL: 3600, checkperiod: 60 }); // 1 hour rate limit window
 
 const { loadConfig: reloadConfig, getConfig } = require("./services/configLoader");
 const { dispatch: dispatchToPartner, track: trackOrder, handleWebhook } = require("./services/deliveryPartner");
-const { sendOTP, sendNotification } = require("./services/smsGateway");
 const { validatePincode } = require("./services/pincodeValidator");
 
 const app = express();
@@ -228,7 +221,7 @@ function startListeners() {
 
         // --- Part B: Generate OTP when status becomes "Awaiting Verification" ---
         if (newStatus === "Awaiting Verification" && !order.verificationCode) {
-          const code = Math.floor(100000 + Math.random() * 900000).toString();
+          const code = Math.floor(1000 + Math.random() * 9000).toString();
           try {
             await change.doc.ref.update({ verificationCode: code });
             const userDoc = await db.collection("users").doc(userId).get();
@@ -525,16 +518,7 @@ app.post("/paySalary", verifyFirebaseToken, requireOwner, validate(paySalarySche
   }
 });
 
-app.post("/sendSMSOTP", validate(sendSMSOTPSchema), async (req, res) => {
-  try {
-    const { phoneNumber, otp } = req.body;
-    logger.info(`SMS OTP for ${phoneNumber}: ${otp}`);
-    return res.json({ success: true, message: "FCM is primary; SMS provider not configured." });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
+
 
 // ─── Analytics Aggregation Helpers ───
 async function incrementDailyStats(amount, isCancelled = false) {
@@ -1297,9 +1281,6 @@ app.get("/api/app-config", async (req, res) => {
     if (safeConfig.notifications) {
       safeConfig.notifications = { ...safeConfig.notifications };
       delete safeConfig.notifications.whatsAppApiKey;
-      delete safeConfig.notifications.smsApiKey;
-      delete safeConfig.notifications.smsProviderApiKey;
-      delete safeConfig.notifications.smsGatewayApiKey;
     }
     if (safeConfig.delivery?.partners) {
       safeConfig.delivery = { ...safeConfig.delivery };
@@ -1314,113 +1295,7 @@ app.get("/api/app-config", async (req, res) => {
   }
 });
 
-// ─── SMS Auth Endpoints ───
 
-// 1. POST /api/auth/send-phone-otp — Generate and send OTP via SMS gateway
-app.post("/api/auth/send-phone-otp", validate(sendPhoneOTPSchema), async (req, res) => {
-  try {
-    const { phoneNumber } = req.validated;
-    const rateKey = `rate_${phoneNumber}`;
-    const rateData = otpRateCache.get(rateKey) || 0;
-    if (rateData >= 3) {
-      return res.status(429).json({ success: false, error: "Too many OTP requests. Try again later." });
-    }
-    otpRateCache.set(rateKey, rateData + 1);
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
-    const existing = otpCache.get(phoneNumber);
-    if (existing && existing.attempts >= 3) {
-      return res.status(429).json({ success: false, error: "Too many attempts. Request a new OTP." });
-    }
-    otpCache.set(phoneNumber, { otp, phoneNumber, attempts: 0, createdAt: Date.now() });
-    const result = await sendOTP(phoneNumber, otp);
-    if (!result.success && !result.simulated) {
-      return res.status(502).json({ success: false, error: "Failed to send SMS. Try again." });
-    }
-    logger.info(`OTP ${result.simulated ? "(simulated) " : ""}sent to ${phoneNumber}`);
-    return res.json({ success: true, simulated: !!result.simulated, message: "OTP sent" });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 2. POST /api/auth/verify-phone-otp — Verify OTP and return custom token or link prompt
-app.post("/api/auth/verify-phone-otp", validate(verifyPhoneOTPSchema), async (req, res) => {
-  try {
-    const { phoneNumber, otp } = req.validated;
-    const record = otpCache.get(phoneNumber);
-    if (!record) {
-      return res.status(400).json({ success: false, error: "No OTP requested for this number. Request a new OTP." });
-    }
-    record.attempts = (record.attempts || 0) + 1;
-    otpCache.set(phoneNumber, record);
-    if (record.attempts > 3) {
-      otpCache.del(phoneNumber);
-      return res.status(429).json({ success: false, error: "Too many incorrect attempts. Request a new OTP." });
-    }
-    if (record.otp !== otp) {
-      const remaining = 3 - record.attempts;
-      return res.status(400).json({ success: false, error: `Invalid OTP. ${remaining} attempt${remaining !== 1 ? "s" : ""} remaining.` });
-    }
-    otpCache.del(phoneNumber);
-    const phoneDoc = await db.collection("phoneLinks").doc(phoneNumber).get();
-    if (phoneDoc.exists && phoneDoc.data().isActive !== false && phoneDoc.data().googleUid) {
-      const { googleUid, googleEmail } = phoneDoc.data();
-      const customToken = await admin.auth().createCustomToken(googleUid);
-      try {
-        await admin.auth().updateUser(googleUid, { phoneNumber });
-      } catch (_) {}
-      await phoneDoc.ref.update({ lastUsedAt: admin.firestore.FieldValue.serverTimestamp() });
-      return res.json({ success: true, linked: true, customToken, googleUid, googleEmail });
-    }
-    return res.json({ success: true, linked: false, phoneNumber, message: "Phone verified. Link with Google to continue." });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 3. POST /api/auth/link-phone-to-google — Link phone number to Google account
-app.post("/api/auth/link-phone-to-google", verifyFirebaseToken, validate(linkPhoneToGoogleSchema), async (req, res) => {
-  try {
-    const { phoneNumber, googleUid, googleEmail } = req.validated;
-    const authUid = req.user?.uid || req.validated.googleUid;
-    if (authUid !== googleUid) {
-      return res.status(403).json({ success: false, error: "googleUid does not match authenticated user" });
-    }
-    const phoneDocRef = db.collection("phoneLinks").doc(phoneNumber);
-    await phoneDocRef.set({
-      googleUid,
-      googleEmail: googleEmail || "",
-      linkedAt: admin.firestore.FieldValue.serverTimestamp(),
-      lastUsedAt: admin.firestore.FieldValue.serverTimestamp(),
-      isActive: true,
-    }, { merge: true });
-    try {
-      await admin.auth().updateUser(googleUid, { phoneNumber });
-    } catch (_) {}
-    const customToken = await admin.auth().createCustomToken(googleUid);
-    return res.json({ success: true, customToken, googleUid, message: "Phone linked successfully" });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 4. POST /api/auth/send-sms-notification — Send arbitrary SMS (ticket alerts, delivery updates, sale offers)
-app.post("/api/auth/send-sms-notification", apiKeyAuth, validate(sendSMSNotificationSchema), async (req, res) => {
-  try {
-    const { phoneNumber, message } = req.validated;
-    const result = await sendNotification(phoneNumber, message);
-    if (!result.success && !result.simulated) {
-      return res.status(502).json({ success: false, error: "Failed to send SMS." });
-    }
-    return res.json({ success: true, simulated: !!result.simulated, message: "SMS sent" });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
 
 // ─── Delivery Location Endpoints ───
 
@@ -1539,47 +1414,31 @@ app.post("/api/auth/send-otp-fcm", verifyFirebaseToken, validate(sendOTPFcmSchem
     if (rateRecord && rateRecord.count >= 3) {
       return res.status(429).json({ success: false, error: "Too many OTP requests. Try again later." });
     }
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = Math.floor(1000 + Math.random() * 9000).toString();
     const cacheKey = `fcm_otp_${userId}_${phoneNumber}`;
     otpCache.set(cacheKey, { otp, attempts: 0, expiresAt: Date.now() + 300000 }, 600);
     if (rateRecord) { rateRecord.count++; otpCache.set(rateKey, rateRecord, 3600); }
     else { otpCache.set(rateKey, { count: 1 }, 3600); }
 
-    // Try FCM push first
     const userDoc = await admin.firestore().collection("users").doc(userId).get();
     const fcmToken = userDoc.data()?.fcmToken;
-    let sentViaFcm = false;
-    if (fcmToken) {
-      try {
-        await admin.messaging().send({
-          token: fcmToken,
-          notification: { title: `Your OTP is ${otp}`, body: `Use ${otp} to verify your phone. Valid 5 min.` },
-          data: { type: "otp_verification", otp, phoneNumber },
-        });
-        sentViaFcm = true;
-        logger.info(`OTP sent via FCM to user ${userId}`);
-      } catch (fcmErr) {
-        logger.warn(`FCM send failed for ${userId}: ${fcmErr.message}`);
-      }
+    if (!fcmToken) {
+      otpCache.del(cacheKey);
+      return res.status(502).json({ success: false, error: "No FCM token registered. Please enable notifications." });
     }
-
-    // If FCM failed, inform client to use SMS fallback
-    if (!sentViaFcm) {
-      const smsResult = await require("./services/smsGateway").sendOTP(phoneNumber, otp);
-      if (smsResult.simulated) {
-        // Gateway not configured — log OTP for dev
-        logger.info(`[DEV] OTP for ${phoneNumber}: ${otp}`);
-        return res.json({ success: true, channel: "simulated", message: "Check server logs for OTP (SMS gateway not configured)" });
-      }
-      if (!smsResult.success) {
-        otpCache.del(cacheKey);
-        return res.status(502).json({ success: false, error: "Failed to send OTP. Enable notifications or configure SMS gateway." });
-      }
-      logger.info(`OTP sent via SMS fallback to ${phoneNumber}`);
-      return res.json({ success: true, channel: "sms" });
+    try {
+      await admin.messaging().send({
+        token: fcmToken,
+        notification: { title: `Your OTP is ${otp}`, body: `Use ${otp} to verify your phone. Valid 5 min.` },
+        data: { type: "otp_verification", otp, phoneNumber },
+      });
+      logger.info(`OTP sent via FCM to user ${userId}`);
+      return res.json({ success: true, channel: "fcm" });
+    } catch (fcmErr) {
+      otpCache.del(cacheKey);
+      logger.warn(`FCM send failed for ${userId}: ${fcmErr.message}`);
+      return res.status(502).json({ success: false, error: "Failed to send OTP via FCM." });
     }
-
-    return res.json({ success: true, channel: "fcm" });
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });

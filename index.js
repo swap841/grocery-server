@@ -585,6 +585,35 @@ app.post("/api/orders/create", verifyFirebaseToken, orderRateLimiter, validate(c
     const orderId = `order_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const now = new Date().toISOString();
 
+    // Reserve stock temporarily
+    const stockReservations = [];
+    for (const item of orderData.items || []) {
+      if (item.productId) {
+        const productRef = admin.firestore().collection("products").doc(item.productId);
+        const productSnap = await productRef.get();
+        const currentStock = productSnap.data()?.stock || 0;
+        if (currentStock < (item.quantity || 1)) {
+          return res.status(400).json({
+            success: false,
+            error: `"${item.name || 'item'}" only ${currentStock} left in stock.`,
+          });
+        }
+        // Decrement stock
+        stockReservations.push({
+          ref: productRef,
+          decrement: item.quantity || 1,
+          name: item.name,
+        });
+      }
+    }
+
+    // If stock check passes, decrement
+    for (const reservation of stockReservations) {
+      await reservation.ref.update({
+        stock: admin.firestore.FieldValue.increment(-reservation.decrement),
+      });
+    }
+
     const batch = db.batch();
 
     // 1. Create order document (dual: top-level + user subcollection)
@@ -609,43 +638,72 @@ app.post("/api/orders/create", verifyFirebaseToken, orderRateLimiter, validate(c
       currency: "INR", userId, orderId, createdAt: now,
     });
 
-    // 3. Decrement stock for each item
-    if (orderData.items && Array.isArray(orderData.items)) {
-      for (const item of orderData.items) {
-        if (item.productId) {
-          const productRef = db.collection("products").doc(item.productId);
-          batch.update(productRef, { stock: FieldValue.increment(-(item.quantity || 1)) });
-        }
-      }
-    }
-
-    // 4. Increment coupon usage
+    // 3. Increment coupon usage
     if (couponCode) {
       const couponRef = db.collection("coupons").doc(couponCode.toUpperCase());
       batch.update(couponRef, { usedCount: FieldValue.increment(1) });
     }
 
-    // Check stock availability
-    for (const item of orderData.items || []) {
-      if (item.productId) {
-        try {
-          const productRef = admin.firestore().collection("products").doc(item.productId);
-          const productSnap = await productRef.get();
-          const currentStock = productSnap.data()?.stock || 0;
-          if (currentStock < (item.quantity || 1)) {
-            return res.status(400).json({ 
-              success: false, 
-              error: `Insufficient stock for "${item.name || 'item'}". Only ${currentStock} available.` 
-            });
-          }
-        } catch (e) {
-          // Skip stock check if product doesn't exist
+    await batch.commit();
+    await incrementDailyStats(orderData.totalAmount || 0);
+
+    // After creating the order, if out of radius
+    if (orderData.outOfRadius || orderData.outOfCity) {
+      const config = getConfig();
+      const partnerPayload = {
+        orderId: topOrderRef.id,
+        type: "grocery",
+        serviceType: "immediate",
+        sender: {
+          name: config?.business?.name || "My Store",
+          phone: config?.contact?.phone || "",
+          address: config?.store?.location?.address || "",
+          pincode: config?.store?.location?.pincode || "",
+        },
+        receiver: {
+          name: orderData.customerName || "",
+          phone: orderData.phone || "",
+          address: orderData.address || "",
+          pincode: orderData.pincode || "",
+          coordinates: {
+            lat: orderData.latitude || 0,
+            lng: orderData.longitude || 0,
+          },
+        },
+        weight: orderData.totalWeight || 1,
+        paymentType: orderData.paymentMethod === "cod" ? "cod" : "prepaid",
+        amountToCollect: orderData.paymentMethod === "cod" ? orderData.total : 0,
+        items: (orderData.items || []).map(item => ({
+          name: item.name,
+          quantity: item.quantity,
+          weight: item.weight || 0.5,
+        })),
+        createdAt: new Date().toISOString(),
+      };
+
+      // Store partner payload in order
+      await topOrderRef.update({ partnerPayload });
+
+      // Try to auto-dispatch
+      try {
+        const SERVER_URL = `${req.protocol}://${req.get('host')}`;
+        const dispatchRes = await fetch(`${SERVER_URL}/api/dispatch-to-partner`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ orderId: topOrderRef.id, partnerPayload }),
+        });
+        const dispatchData = await dispatchRes.json();
+        if (dispatchData.success) {
+          await topOrderRef.update({
+            thirdPartyDeliveryId: dispatchData.partnerReferenceId,
+            status: "Dispatched to Partner",
+          });
         }
+      } catch (dispatchErr) {
+        console.error("[ORDER] Auto-dispatch failed:", dispatchErr.message);
       }
     }
 
-    await batch.commit();
-    await incrementDailyStats(orderData.totalAmount || 0);
     logger.info(`COD order ${orderId} created for user ${userId}`);
     return res.json({ success: true, orderId });
   } catch (err) {
@@ -698,6 +756,36 @@ app.post("/api/razorpay/verify-payment", verifyFirebaseToken, orderRateLimiter, 
     }
     const orderId = `order_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const now = new Date().toISOString();
+
+    // Reserve stock temporarily
+    const stockReservations = [];
+    for (const item of orderData.items || []) {
+      if (item.productId) {
+        const productRef = admin.firestore().collection("products").doc(item.productId);
+        const productSnap = await productRef.get();
+        const currentStock = productSnap.data()?.stock || 0;
+        if (currentStock < (item.quantity || 1)) {
+          return res.status(400).json({
+            success: false,
+            error: `"${item.name || 'item'}" only ${currentStock} left in stock.`,
+          });
+        }
+        // Decrement stock
+        stockReservations.push({
+          ref: productRef,
+          decrement: item.quantity || 1,
+          name: item.name,
+        });
+      }
+    }
+
+    // If stock check passes, decrement
+    for (const reservation of stockReservations) {
+      await reservation.ref.update({
+        stock: admin.firestore.FieldValue.increment(-reservation.decrement),
+      });
+    }
+
     const writes = [
       db.collection("orders").doc(orderId).set({
         ...orderData, id: orderId, userId,
@@ -715,31 +803,6 @@ app.post("/api/razorpay/verify-payment", verifyFirebaseToken, orderRateLimiter, 
         currency: "INR", userId, orderId, createdAt: now,
       }),
     ];
-    if (orderData.items && Array.isArray(orderData.items)) {
-      for (const item of orderData.items) {
-        if (item.productId) {
-          writes.push(db.collection("products").doc(item.productId).update({ stock: FieldValue.increment(-(item.quantity || 1)) }));
-        }
-      }
-    }
-    // Check stock availability
-    for (const item of orderData.items || []) {
-      if (item.productId) {
-        try {
-          const productRef = admin.firestore().collection("products").doc(item.productId);
-          const productSnap = await productRef.get();
-          const currentStock = productSnap.data()?.stock || 0;
-          if (currentStock < (item.quantity || 1)) {
-            return res.status(400).json({ 
-              success: false, 
-              error: `Insufficient stock for "${item.name || 'item'}". Only ${currentStock} available.` 
-            });
-          }
-        } catch (e) {
-          // Skip stock check if product doesn't exist
-        }
-      }
-    }
 
     if (couponCode) {
       writes.push(db.collection("coupons").doc(couponCode.toUpperCase()).update({ usedCount: FieldValue.increment(1) }));
@@ -1178,62 +1241,54 @@ app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
   try {
     const { orderId, userId, reason } = req.body;
     if (!orderId || !userId) {
-      return res.status(400).json({ success: false, error: "Missing orderId or userId" });
+      return res.status(400).json({ success: false, error: "orderId and userId required" });
     }
-    const orderRef = db.collection("users").doc(userId).collection("orders").doc(orderId);
+
+    const orderRef = admin.firestore().collection("orders").doc(orderId);
     const orderSnap = await orderRef.get();
+
     if (!orderSnap.exists) {
       return res.status(404).json({ success: false, error: "Order not found" });
     }
+
     const order = orderSnap.data();
-    const cancellable = ["Pending", "pending", "Packing", "packing"];
-    if (!cancellable.includes(order?.status)) {
-      return res.status(400).json({ success: false, error: `Cannot cancel order in status: ${order?.status}` });
-    }
-    const batch = db.batch();
-    batch.update(orderRef, { status: "Cancelled", cancelledAt: new Date().toISOString(), cancelReason: reason || "Customer request" });
-    if (order?.items && Array.isArray(order.items)) {
-      for (const item of order.items) {
-        if (item.productId) {
-          const productRef = db.collection("products").doc(item.productId);
-          batch.update(productRef, { stock: FieldValue.increment(item.quantity || 1) });
-        }
-      }
-    }
-    await batch.commit();
-    const paymentMethod = order?.payment?.method || "";
-    const isRazorpay = paymentMethod === "razorpay" || order?.payment?.razorpayPaymentId;
-    let refundId = null;
-    if (isRazorpay && order?.payment?.razorpayPaymentId) {
-      try {
-        const config2 = getConfig();
-        const keyId = config2?.payment?.razorpayKeyId || process.env.RAZORPAY_KEY_ID;
-        const keySecret = config2?.payment?.razorpayKeySecret || process.env.RAZORPAY_KEY_SECRET;
-        if (keyId && keySecret) {
-          const basic = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
-          const rpRes = await fetch(`https://api.razorpay.com/v1/payments/${order.payment.razorpayPaymentId}/refund`, {
-            method: "POST",
-            headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/json" },
-          });
-          if (rpRes.ok) {
-            const rpData = await rpRes.json();
-            refundId = rpData.id;
-          }
-        }
-      } catch (refundErr) {
-        logger.warn(`Refund failed for order ${orderId}: ${refundErr.message}`);
-      }
-      await db.collection("refunds").add({
-        orderId, userId, amount: order.totalAmount || 0, reason: reason || "Customer cancellation",
-        razorpayRefundId: refundId, status: refundId ? "Approved" : "Pending", createdAt: new Date().toISOString(),
+
+    // Only allow cancellation if status is Pending or Confirmed
+    if (!["Pending", "Confirmed"].includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot cancel order with status "${order.status}". Only Pending or Confirmed orders can be cancelled.`,
       });
     }
-    await incrementDailyStats(order.totalAmount || 0, true);
-    logger.info(`Order ${orderId} cancelled by user ${userId}`);
-    return res.json({ success: true, message: "Order cancelled", refundId });
-  } catch (err) {
-    logErrorToFirestore(err, req);
-    return res.status(500).json({ success: false, error: err.message || "Cancel failed" });
+
+    // Update order status
+    await orderRef.update({
+      status: "Cancelled",
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      cancelledBy: userId,
+      cancelReason: reason || "Customer request",
+    });
+
+    // Restore stock
+    for (const item of order.items || []) {
+      if (item.productId) {
+        const productRef = admin.firestore().collection("products").doc(item.productId);
+        await productRef.update({
+          stock: admin.firestore.FieldValue.increment(item.quantity || 1),
+        });
+      }
+    }
+
+    // If Razorpay order, initiate refund
+    if (order.paymentMethod === "online" && order.razorpayOrderId) {
+      // TODO: Integrate Razorpay refund API
+      console.log(`[CANCEL] Refund needed for order ${orderId}`);
+    }
+
+    res.json({ success: true, message: "Order cancelled successfully" });
+  } catch (error) {
+    console.error("[CANCEL] Error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to cancel order" });
   }
 });
 

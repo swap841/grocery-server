@@ -558,19 +558,28 @@ async function incrementDailyStats(amount, isCancelled = false) {
 
 // ─── Order Rate Limiter ───
 const orderRateLimit = new Map();
+const ORDER_RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const ORDER_RATE_MAX = 10;
+
+// Clean up expired entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of orderRateLimit) {
+    if (now > entry.resetTime) orderRateLimit.delete(key);
+  }
+}, 5 * 60 * 1000);
+
 function orderRateLimiter(req, res, next) {
   const userId = req.body?.userId || req.user?.uid || req.ip;
   const now = Date.now();
-  const windowMs = 60 * 60 * 1000;
-  const maxOrders = 10;
   const entry = orderRateLimit.get(userId);
   if (entry && now < entry.resetTime) {
-    if (entry.count >= maxOrders) {
+    if (entry.count >= ORDER_RATE_MAX) {
       return res.status(429).json({ success: false, error: "Too many orders. Please try again after 1 hour." });
     }
     entry.count++;
   } else {
-    orderRateLimit.set(userId, { count: 1, resetTime: now + windowMs });
+    orderRateLimit.set(userId, { count: 1, resetTime: now + ORDER_RATE_WINDOW_MS });
   }
   next();
 }

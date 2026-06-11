@@ -553,6 +553,7 @@ app.post("/verifyDeliveryCode", validate(verifyDeliveryCodeSchema), async (req, 
     if (order.status !== "Awaiting Verification") return res.status(400).json({ success: false, error: "Order not awaiting verification" });
     if (order.verificationCode !== code) return res.status(403).json({ success: false, error: "Invalid code" });
     await orderDoc.ref.update({ status: "Delivered", deliveredAt: FieldValue.serverTimestamp() });
+    updateOrderCounter(orderId, order.userId);
     logger.info(`Order ${orderId} verified and marked delivered`);
     return res.json({ success: true, message: "Delivery verified" });
   } catch (err) {
@@ -591,9 +592,10 @@ app.post("/thirdPartyWebhook", apiKeyAuth, validate(thirdPartyWebhookSchema), as
     await logsSnap.docs[0].ref.update({ status, updatedAt: FieldValue.serverTimestamp() });
     if (status === "Delivered" && orderId) {
       const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
-      await Promise.all(ordersSnap.docs.map((doc) =>
-        doc.ref.update({ status: "Delivered", deliveredAt: FieldValue.serverTimestamp() })
-      ));
+      for (const doc of ordersSnap.docs) {
+        await doc.ref.update({ status: "Delivered", deliveredAt: FieldValue.serverTimestamp() });
+        updateOrderCounter(orderId, doc.data().userId);
+      }
     }
     logger.info(`Webhook: ${trackingId} → ${status}`);
     return res.json({ success: true });
@@ -632,6 +634,30 @@ async function incrementDailyStats(amount, isCancelled = false) {
       : { totalOrders: FieldValue.increment(1), totalRevenue: FieldValue.increment(amount) };
     update.lastUpdated = FieldValue.serverTimestamp();
     await ref.set(update, { merge: true });
+  } catch (err) {
+    logErrorToFirestore(err);
+  }
+}
+
+// ─── Order Counter — update user's completed order stats ───
+async function updateOrderCounter(orderId, userId) {
+  try {
+    if (!userId) return;
+    const userRef = db.collection("users").doc(userId);
+    await userRef.set({
+      completedCount: FieldValue.increment(1),
+      lastCompletedAt: new Date().toISOString(),
+      lastCompletedOrderId: orderId,
+      totalSpent: FieldValue.increment(0), // placeholder — pass amount if available
+    }, { merge: true });
+    const userDoc = await userRef.get();
+    const data = userDoc.data() || {};
+    const count = data.completedCount || 0;
+    if (count <= 4) return;
+    const orderSnap = await userRef.collection("orders").orderBy("createdAt", "asc").limit(count - 4).get();
+    const batch = db.batch();
+    orderSnap.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
   } catch (err) {
     logErrorToFirestore(err);
   }
@@ -1483,7 +1509,6 @@ app.post("/api/verify-delivery-otp", async (req, res) => {
         deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
         deliveryVerifiedBy: "customer",
       });
-      // Also update subcollection
       const orderSnap = await admin.firestore().collection("orders").doc(orderId).get();
       const orderData = orderSnap.data();
       if (orderData?.userId) {
@@ -1491,6 +1516,7 @@ app.post("/api/verify-delivery-otp", async (req, res) => {
           status: "Delivered",
           deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+        updateOrderCounter(orderId, orderData.userId);
       }
     } catch (e) {}
 
@@ -1501,12 +1527,59 @@ app.post("/api/verify-delivery-otp", async (req, res) => {
   }
 });
 
+// ─── Delivery Boy Send OTP (called by Android app) ───
+app.post("/sendSMSOTP", async (req, res) => {
+  try {
+    const { phone, otp, orderId } = req.body;
+    if (!orderId || !otp) {
+      return res.status(400).json({ success: false, error: "orderId and otp required" });
+    }
+    logger.info(`[SMSOTP] Delivery OTP for order ${orderId} to phone ${phone || "unknown"}`);
+    const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
+    if (ordersSnap.empty) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+    const order = ordersSnap.docs[0].data();
+    const customerEmail = order.userEmail || order.address?.email;
+    const customerName = order.userName || order.address?.name || "Customer";
+    if (customerEmail) {
+      try {
+        const transporter = createMailTransporter();
+        const cfg = configLoader.getConfig();
+        const smtpUser = cfg?.integrations?.smtp?.user || process.env.SMTP_USER || "";
+        await transporter.sendMail({
+          from: `"Grocery Store" <${smtpUser}>`,
+          to: customerEmail,
+          subject: `Delivery OTP for Order #${orderId.slice(-8).toUpperCase()}`,
+          html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+            <h2 style="color:#059669;">Delivery Verification</h2>
+            <p>Hi ${customerName},</p>
+            <p>Your delivery partner is at your location. Share this OTP to confirm delivery:</p>
+            <div style="font-size:32px;font-weight:bold;letter-spacing:8px;text-align:center;padding:16px;background:#f0fdf4;border-radius:12px;margin:16px 0;">${otp}</div>
+            <p style="color:#666;font-size:14px;">This code expires in 10 minutes.</p>
+            <p style="color:#999;font-size:12px;">Order: #${orderId.slice(-8).toUpperCase()}</p>
+          </div>`,
+        });
+        logger.info(`[SMSOTP] Email sent to ${customerEmail} for order ${orderId}`);
+        return res.json({ success: true, message: "OTP sent via email" });
+      } catch (emailErr) {
+        logger.error("[SMSOTP] Email failed:", emailErr.message);
+      }
+    }
+    return res.json({ success: true, message: "OTP generated", otp });
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ─── Order Cancel Endpoint ───
 app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
   try {
-    const { orderId, userId, reason } = req.body;
-    if (!orderId || !userId) {
-      return res.status(400).json({ success: false, error: "orderId and userId required" });
+    const { orderId, reason } = req.body;
+    const userId = req.user.uid;
+    if (!orderId) {
+      return res.status(400).json({ success: false, error: "orderId required" });
     }
 
     const orderRef = admin.firestore().collection("orders").doc(orderId);
@@ -1641,7 +1714,17 @@ app.get("/api/config", async (req, res) => {
     }
     let config;
     if (snap.exists) {
-      config = { id: snap.id, ...snap.data() };
+      const raw = snap.data();
+      config = {
+        id: snap.id,
+        branding: raw.branding || null,
+        store: raw.store || null,
+        features: raw.features || null,
+        seo: raw.seo || null,
+        contact: raw.contact || null,
+        ai: raw.ai || null,
+        updatedAt: raw.updatedAt || new Date().toISOString(),
+      };
     } else {
       config = {
         id: "main", branding: {}, store: { isOpen: true, maintenanceMode: false },
@@ -1807,6 +1890,7 @@ app.post("/api/partner-webhook", async (req, res) => {
       const ordersSnap = await db.collectionGroup("orders").where("__name__", "==", orderId).get();
       for (const doc of ordersSnap.docs) {
         await doc.ref.update({ status: "Delivered", deliveredAt: new Date().toISOString() });
+        updateOrderCounter(orderId, doc.data().userId);
       }
     }
     logger.info(`Webhook from ${partner}: ${trackingId} → ${status}`);

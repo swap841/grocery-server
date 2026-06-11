@@ -158,7 +158,9 @@ function debounce(fn, ms = 1000) {
 
 function startListeners() {
   // 1. New pending orders → notify workers
-  const unsubOrders = db.collectionGroup("orders").onSnapshot(
+  const unsubOrders = db.collectionGroup("orders")
+    .where("status", "in", ["Pending", "Packing", "Ready to Dispatch", "Assigned", "Accepted", "Out for Delivery", "Awaiting Verification"])
+    .onSnapshot(
     (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type !== "added") return;
@@ -242,7 +244,9 @@ function startListeners() {
   }, 300000); // 5 min interval
 
   // 2+3. Order status changes → notify customer + OTP generation (combined)
-  const unsubCombinedStatus = db.collectionGroup("orders").onSnapshot(
+  const unsubCombinedStatus = db.collectionGroup("orders")
+    .where("status", "in", ["Pending", "Packing", "Ready to Dispatch", "Assigned", "Accepted", "Out for Delivery", "Awaiting Verification", "Delivered"])
+    .onSnapshot(
     (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type !== "modified") return;
@@ -359,7 +363,9 @@ function startListeners() {
     }
   }, 5000);
 
-  const unsubStock = db.collection("products").onSnapshot(
+  const unsubStock = db.collection("products")
+    .where("stock", "<", 30)
+    .onSnapshot(
     (snapshot) => {
       snapshot.docChanges().forEach((change) => {
         if (change.type !== "modified" && change.type !== "added") return;
@@ -1831,6 +1837,26 @@ app.post("/api/clear-cache", verifyFirebaseToken, requireOwner, async (req, res)
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── Stock Batch API ───
+app.get("/api/products/stock-batch", async (req, res) => {
+  try {
+    let ids = req.query.ids;
+    if (!ids) return res.status(400).json({ error: "Missing ids query param" });
+    if (typeof ids === "string") ids = ids.split(",").filter(Boolean);
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: "No valid ids provided" });
+    if (ids.length > 100) return res.status(400).json({ error: "Max 100 ids per request" });
+    const snap = await db.collection("products").where("__name__", "in", ids.slice(0, 10)).get();
+    const stockMap = {};
+    snap.forEach((doc) => { stockMap[doc.id] = doc.data().stock ?? 0; });
+    ids.forEach((id) => { if (stockMap[id] === undefined) stockMap[id] = 0; });
+    res.set("Cache-Control", "public, max-age=30, s-maxage=30");
+    return res.json(stockMap);
+  } catch (err) {
+    logErrorToFirestore(err, req);
+    return res.status(500).json({ error: err.message });
   }
 });
 

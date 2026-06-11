@@ -5,6 +5,7 @@ const compression = require("compression");
 const admin = require("firebase-admin");
 const { FieldValue } = require("firebase-admin/firestore");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 const multer = require("multer");
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -81,6 +82,8 @@ setInterval(cleanExpiredOTPs, 60000);
 const { loadConfig: reloadConfig, getConfig } = require("./services/configLoader");
 const { dispatch: dispatchToPartner, track: trackOrder, handleWebhook } = require("./services/deliveryPartner");
 const { validatePincode } = require("./services/pincodeValidator");
+const whatsapp = require("./services/whatsappFree");
+const voiceAlert = require("./services/voiceAlertFree");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -161,6 +164,8 @@ function startListeners() {
         if (change.type !== "added") return;
         const order = change.doc.data();
         if (!order || order.status !== "Pending") return;
+        const userId = order.userId;
+        if (!userId) return;
         try {
           const workersSnap = await db.collection("workers").where("active", "==", true).limit(50).get();
           const tokens = [];
@@ -174,6 +179,35 @@ function startListeners() {
               orderId: change.doc.id,
             });
           }
+          // WhatsApp: confirm order to customer
+          if (order.userPhone) {
+            const phone = order.userPhone.replace(/[^0-9]/g, "");
+            if (phone.length >= 10) {
+              await whatsapp.sendOrderConfirmation(
+                phone,
+                change.doc.id.slice(-8).toUpperCase(),
+                order.totalAmount || 0,
+                order.estimatedDeliveryDate || "Soon"
+              );
+            }
+          }
+          // Data retention: keep max 4 completed orders per user, delete oldest
+          const completedSnap = await db.collection("users").doc(userId).collection("orders")
+            .where("status", "in", ["Delivered", "Cancelled"])
+            .orderBy("createdAt", "desc")
+            .get();
+          if (completedSnap.size > 4) {
+            const toDelete = completedSnap.docs.slice(4);
+            const batch = db.batch();
+            for (const doc of toDelete) {
+              batch.delete(doc.ref);
+              // Also delete top-level order
+              const topRef = db.collection("orders").doc(doc.id);
+              batch.delete(topRef);
+            }
+            await batch.commit();
+            logger.info(`[Retention] Deleted ${toDelete.length} old orders for user ${userId}`);
+          }
         } catch (err) {
           logErrorToFirestore(err);
         }
@@ -182,6 +216,30 @@ function startListeners() {
     (err) => logger.error("Orders listener error:", err)
   );
   listeners.push(unsubOrders);
+
+  // Order delay detection: check every 5 min for orders pending > 30 min
+  setInterval(async () => {
+    try {
+      const cutoff = new Date(Date.now() - 30 * 60 * 1000);
+      const snap = await db.collectionGroup("orders")
+        .where("status", "==", "Pending")
+        .where("createdAt", "<", cutoff)
+        .limit(10)
+        .get();
+      if (snap.empty) return;
+      const infoSnap = await db.collection("contactInfo").doc("info").get();
+      const ownerId = infoSnap.data()?.ownerId || "";
+      if (!ownerId) return;
+      for (const doc of snap.docs) {
+        const order = doc.data();
+        const created = order.createdAt?.toDate?.() || new Date(order.createdAt?.seconds * 1000 || Date.now());
+        const mins = Math.round((Date.now() - created.getTime()) / 60000);
+        await voiceAlert.notifyOrderDelay(ownerId, doc.id.slice(-8).toUpperCase(), mins);
+      }
+    } catch (err) {
+      logErrorToFirestore(err);
+    }
+  }, 300000); // 5 min interval
 
   // 2+3. Order status changes → notify customer + OTP generation (combined)
   const unsubCombinedStatus = db.collectionGroup("orders").onSnapshot(
@@ -233,6 +291,13 @@ function startListeners() {
                 type: "order_status", orderId, status: newStatus,
               });
             }
+            // WhatsApp delivery update
+            if (order.userPhone) {
+              const phone = order.userPhone.replace(/[^0-9]/g, "");
+              if (phone.length >= 10) {
+                await whatsapp.sendDeliveryUpdate(phone, orderId.slice(-8).toUpperCase(), newStatus);
+              }
+            }
           } catch (err) {
             logErrorToFirestore(err);
           }
@@ -250,6 +315,13 @@ function startListeners() {
                 type: "delivery_otp", orderId, code,
               });
             }
+            // WhatsApp OTP
+            if (order.userPhone) {
+              const phone = order.userPhone.replace(/[^0-9]/g, "");
+              if (phone.length >= 10) {
+                await whatsapp.sendOTP(phone, code);
+              }
+            }
             logger.info(`OTP ${code} generated for order ${orderId}`);
           } catch (err) {
             logErrorToFirestore(err);
@@ -266,10 +338,21 @@ function startListeners() {
     try {
       const infoSnap = await db.collection("contactInfo").doc("info").get();
       const ownerFcmToken = infoSnap.data()?.ownerFcmToken;
+      const ownerPhone = infoSnap.data()?.phone || "";
       if (ownerFcmToken) {
         await sendFCMToTokenWithRetry(ownerFcmToken, "Low Stock Alert",
           `${product.name || "Product"} is low (${product.stock ?? 0} left)`,
           { type: "low_stock", productId });
+      }
+      // WhatsApp low stock alert
+      const cleanPhone = ownerPhone.replace(/[^0-9]/g, "");
+      if (cleanPhone.length >= 10) {
+        await whatsapp.sendLowStockAlert(cleanPhone, product.name || "Product", product.stock ?? 0);
+      }
+      // Voice alert (FCM-based, free)
+      const ownerId = infoSnap.data()?.ownerId || "";
+      if (ownerId) {
+        await voiceAlert.notifyLowStock(ownerId, product.name || "Product", product.stock ?? 0);
       }
     } catch (err) {
       logErrorToFirestore(err);
@@ -1245,6 +1328,173 @@ app.post("/api/auth/verify-otp", validate(verifyOTPSchema), async (req, res) => 
   }
 });
 
+// ─── Email OTP Store ───
+const emailOtpStore = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of emailOtpStore) {
+    if (now - val.createdAt > 600000) emailOtpStore.delete(key);
+  }
+}, 60000);
+
+// ─── Nodemailer Transporter ───
+function createMailTransporter() {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: parseInt(process.env.SMTP_PORT || "587"),
+    secure: process.env.SMTP_SECURE === "true",
+    auth: {
+      user: process.env.SMTP_USER || "",
+      pass: process.env.SMTP_PASS || "",
+    },
+  });
+}
+
+function generateOtp() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+app.post("/api/send-email-otp", async (req, res) => {
+  try {
+    const { email, phone } = req.body;
+    if (!email) return res.status(400).json({ success: false, error: "Email is required" });
+    if (!phone) return res.status(400).json({ success: false, error: "Phone number is required" });
+
+    const otp = generateOtp();
+    emailOtpStore.set(email, { otp, phone, createdAt: Date.now() });
+
+    try {
+      const transporter = createMailTransporter();
+      await transporter.sendMail({
+        from: `"Grocery Store" <${process.env.SMTP_USER || ""}>`,
+        to: email,
+        subject: "Verify your phone number",
+        html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+          <h2 style="color:#059669;">Phone Verification</h2>
+          <p>Your verification code is:</p>
+          <div style="font-size:32px;font-weight:bold;letter-spacing:8px;text-align:center;padding:16px;background:#f0fdf4;border-radius:12px;margin:16px 0;">${otp}</div>
+          <p style="color:#666;font-size:14px;">This code expires in 10 minutes.</p>
+          <p style="color:#999;font-size:12px;">Phone: ${phone}</p>
+        </div>`,
+      });
+    } catch (mailErr) {
+      console.error("[EMAIL] Sending failed:", mailErr.message);
+      // Fallback: still allow dev flow
+    }
+
+    res.json({ success: true, message: "OTP sent to email" });
+  } catch (error) {
+    console.error("[EMAIL-OTP] Error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to send OTP" });
+  }
+});
+
+app.post("/api/verify-email-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ success: false, error: "Email and OTP required" });
+
+    const stored = emailOtpStore.get(email);
+    if (!stored) return res.status(400).json({ success: false, error: "No OTP sent to this email. Please request a new one." });
+    if (Date.now() - stored.createdAt > 600000) {
+      emailOtpStore.delete(email);
+      return res.status(400).json({ success: false, error: "OTP has expired. Please request a new one." });
+    }
+    if (stored.otp !== otp) return res.status(400).json({ success: false, error: "Invalid OTP. Please try again." });
+
+    emailOtpStore.delete(email);
+
+    // Save phone to user profile
+    if (stored.phone) {
+      try {
+        const decoded = await admin.auth().verifyIdToken(req.headers.authorization?.split("Bearer ")[1] || "");
+        await admin.firestore().collection("users").doc(decoded.uid).set({
+          phone: stored.phone,
+          phoneVerified: true,
+          updatedAt: new Date().toISOString(),
+        }, { merge: true });
+      } catch (e) {}
+    }
+
+    res.json({ success: true, message: "Phone verified successfully" });
+  } catch (error) {
+    console.error("[VERIFY-OTP] Error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to verify OTP" });
+  }
+});
+
+app.post("/api/send-delivery-otp", async (req, res) => {
+  try {
+    const { orderId, email } = req.body;
+    if (!orderId || !email) return res.status(400).json({ success: false, error: "orderId and email required" });
+
+    const otp = generateOtp();
+    emailOtpStore.set(`delivery_${orderId}`, { otp, email, createdAt: Date.now() });
+
+    try {
+      const transporter = createMailTransporter();
+      await transporter.sendMail({
+        from: `"Grocery Store" <${process.env.SMTP_USER || ""}>`,
+        to: email,
+        subject: `Delivery verification for Order #${orderId.slice(-8)}`,
+        html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+          <h2 style="color:#7c3aed;">Delivery Verification</h2>
+          <p>Your delivery has arrived! Enter this code to confirm:</p>
+          <div style="font-size:32px;font-weight:bold;letter-spacing:8px;text-align:center;padding:16px;background:#f5f3ff;border-radius:12px;margin:16px 0;">${otp}</div>
+          <p style="color:#666;font-size:14px;">This code expires in 10 minutes.</p>
+        </div>`,
+      });
+    } catch (mailErr) {
+      console.error("[EMAIL] Delivery OTP failed:", mailErr.message);
+    }
+
+    res.json({ success: true, message: "Delivery OTP sent to email" });
+  } catch (error) {
+    console.error("[DELIVERY-OTP] Error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to send delivery OTP" });
+  }
+});
+
+app.post("/api/verify-delivery-otp", async (req, res) => {
+  try {
+    const { orderId, otp } = req.body;
+    if (!orderId || !otp) return res.status(400).json({ success: false, error: "orderId and OTP required" });
+
+    const stored = emailOtpStore.get(`delivery_${orderId}`);
+    if (!stored) return res.status(400).json({ success: false, error: "No OTP sent for this order. Please request a new one." });
+    if (Date.now() - stored.createdAt > 600000) {
+      emailOtpStore.delete(`delivery_${orderId}`);
+      return res.status(400).json({ success: false, error: "OTP has expired. Please request a new one." });
+    }
+    if (stored.otp !== otp) return res.status(400).json({ success: false, error: "Invalid OTP. Please try again." });
+
+    emailOtpStore.delete(`delivery_${orderId}`);
+
+    // Mark order as delivered
+    try {
+      await admin.firestore().collection("orders").doc(orderId).update({
+        status: "Delivered",
+        deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+        deliveryVerifiedBy: "customer",
+      });
+      // Also update subcollection
+      const orderSnap = await admin.firestore().collection("orders").doc(orderId).get();
+      const orderData = orderSnap.data();
+      if (orderData?.userId) {
+        await admin.firestore().collection("users").doc(orderData.userId).collection("orders").doc(orderId).update({
+          status: "Delivered",
+          deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (e) {}
+
+    res.json({ success: true, message: "Delivery confirmed" });
+  } catch (error) {
+    console.error("[VERIFY-DELIVERY] Error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to verify delivery" });
+  }
+});
+
 // ─── Order Cancel Endpoint ───
 app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
   try {
@@ -1262,12 +1512,16 @@ app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
 
     const order = orderSnap.data();
 
-    // Only allow cancellation if status is Pending or Confirmed
-    if (!["Pending", "Confirmed"].includes(order.status)) {
+    const CANCELLABLE = new Set(["Pending", "Confirmed", "Packing"]);
+    if (!CANCELLABLE.has(order.status)) {
       return res.status(400).json({
         success: false,
-        error: `Cannot cancel order with status "${order.status}". Only Pending or Confirmed orders can be cancelled.`,
+        error: `Cannot cancel order with status "${order.status}".`,
       });
+    }
+
+    if (order.userId !== userId) {
+      return res.status(403).json({ success: false, error: "This order does not belong to you." });
     }
 
     // Update order status
@@ -1278,23 +1532,42 @@ app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
       cancelReason: reason || "Customer request",
     });
 
+    // Also update subcollection
+    try {
+      await admin.firestore().collection("users").doc(userId).collection("orders").doc(orderId).update({
+        status: "Cancelled",
+        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+        cancelReason: reason || "Customer request",
+      });
+    } catch (e) {}
+
     // Restore stock
     for (const item of order.items || []) {
       if (item.productId) {
-        const productRef = admin.firestore().collection("products").doc(item.productId);
-        await productRef.update({
-          stock: admin.firestore.FieldValue.increment(item.quantity || 1),
-        });
+        try {
+          await admin.firestore().collection("products").doc(item.productId).update({
+            stock: admin.firestore.FieldValue.increment(item.quantity || 1),
+          });
+        } catch (e) {}
       }
     }
 
     // If Razorpay order, initiate refund
-    if (order.paymentMethod === "online" && order.razorpayOrderId) {
-      // TODO: Integrate Razorpay refund API
-      console.log(`[CANCEL] Refund needed for order ${orderId}`);
+    let refundAmount = 0;
+    if (order.paymentMethod === "online" || order.payment?.method === "razorpay" || order.paymentMethod === "razorpay") {
+      refundAmount = order.totalAmount || 0;
+      console.log(`[CANCEL] Refund needed for order ${orderId} - Amount: ${refundAmount}`);
     }
 
-    res.json({ success: true, message: "Order cancelled successfully" });
+    // WhatsApp cancellation notification
+    if (order.userPhone) {
+      const phone = order.userPhone.replace(/[^0-9]/g, "");
+      if (phone.length >= 10) {
+        whatsapp.sendOrderCancellation(phone, orderId, refundAmount);
+      }
+    }
+
+    res.json({ success: true, message: "Order cancelled successfully", refundAmount });
   } catch (error) {
     console.error("[CANCEL] Error:", error.message);
     res.status(500).json({ success: false, error: "Failed to cancel order" });
@@ -1672,6 +1945,32 @@ app.get("/api/delivery-zones", async (req, res) => {
   } catch (err) {
     logErrorToFirestore(err, req);
     return res.status(500).json({ error: "Failed to fetch delivery zones" });
+  }
+});
+
+// ─── WhatsApp Broadcast (owner dashboard trigger) ───
+app.post("/api/whatsapp/broadcast", verifyFirebaseToken, requireOwner, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ success: false, error: "Message is required" });
+
+    // Get all customer phone numbers from orders
+    const ordersSnap = await db.collectionGroup("orders")
+      .where("status", "in", ["Delivered", "Pending", "Packing", "Out for Delivery"])
+      .get();
+    const phoneSet = new Set();
+    ordersSnap.forEach(doc => {
+      const data = doc.data();
+      if (data.userPhone) phoneSet.add(data.userPhone.replace(/[^0-9]/g, ""));
+      if (data.address?.phone) phoneSet.add(data.address.phone.replace(/[^0-9]/g, ""));
+    });
+
+    const phones = Array.from(phoneSet).filter(p => p.length >= 10);
+    const result = await whatsapp.broadcast(phones, message);
+    res.json({ success: true, ...result, totalPhones: phones.length });
+  } catch (err) {
+    logErrorToFirestore(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

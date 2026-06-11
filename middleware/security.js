@@ -10,10 +10,19 @@ const helmetMiddleware = helmet({
 });
 
 // ─── CORS ───
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const BASE_ORIGINS = [
+  "https://customer-website-1.onrender.com",
+  "https://owner-dashboard-j73k.onrender.com",
+  "https://customer-website-1.onrender.com/",
+  "https://owner-dashboard-j73k.onrender.com/",
+];
+const ALLOWED_ORIGINS = [
+  ...BASE_ORIGINS,
+  ...(process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+];
 
 const corsMiddleware = cors({
   origin: (origin, cb) => {

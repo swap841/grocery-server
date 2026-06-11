@@ -63,12 +63,12 @@ const createOrderSchema = z.object({
     userId: z.string().min(1, "userId is required"),
     orderData: z.object({
       userName: z.string().min(2, "Name must be at least 2 characters"),
-      userPhone: z.string().regex(/^\d{10}$/, "Phone must be a 10-digit number"),
+      userPhone: z.string().regex(/^[6-9]\d{9}$/, "Phone must be a 10-digit Indian mobile number"),
       userEmail: z.string().email("Invalid email").optional().or(z.literal("")),
       items: z.array(orderItemSchema).min(1, "At least one item is required"),
       address: z.object({
         name: z.string().min(2, "Name must be at least 2 characters"),
-        phone: z.string().regex(/^\d{10}$/, "Phone must be a 10-digit number"),
+        phone: z.string().regex(/^[6-9]\d{9}$/, "Phone must be a 10-digit Indian mobile number"),
         addressLine: z.string().min(5, "Address must be at least 5 characters"),
         pincode: z.string().regex(/^\d{6}$/, "Pincode must be a 6-digit number"),
         city: z.string().optional(),
@@ -103,12 +103,12 @@ const verifyPaymentSchema = z.object({
     userId: z.string().min(1),
     orderData: z.object({
       userName: z.string().min(2),
-      userPhone: z.string().regex(/^\d{10}$/),
+      userPhone: z.string().regex(/^[6-9]\d{9}$/),
       userEmail: z.string().email().optional().or(z.literal("")),
       items: z.array(orderItemSchema).min(1),
       address: z.object({
         name: z.string().min(2),
-        phone: z.string().regex(/^\d{10}$/),
+        phone: z.string().regex(/^[6-9]\d{9}$/),
         addressLine: z.string().min(5),
         pincode: z.string().regex(/^\d{6}$/),
         city: z.string().optional(),

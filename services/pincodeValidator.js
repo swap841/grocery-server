@@ -41,17 +41,10 @@ async function validatePincode(pincode) {
     cache.set(pincode, result);
     return result;
   } catch (err) {
-    // Fallback: basic regex check for common Indian pincodes
     const result = {
-      valid: /^\d{6}$/.test(pincode),
-      fallback: true,
+      valid: false,
+      error: "India Post API unavailable — could not verify pincode",
       pincode,
-      city: "",
-      state: "",
-      district: "",
-      country: "India",
-      area: "",
-      warning: "Could not verify with India Post API",
     };
     cache.set(pincode, result);
     return result;

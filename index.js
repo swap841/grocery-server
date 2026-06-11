@@ -182,7 +182,7 @@ function startListeners() {
           // WhatsApp: confirm order to customer
           if (order.userPhone) {
             const phone = order.userPhone.replace(/[^0-9]/g, "");
-            if (phone.length >= 10) {
+            if (/^[6-9]\d{9}$/.test(phone)) {
               await whatsapp.sendOrderConfirmation(
                 phone,
                 change.doc.id.slice(-8).toUpperCase(),
@@ -294,7 +294,7 @@ function startListeners() {
             // WhatsApp delivery update
             if (order.userPhone) {
               const phone = order.userPhone.replace(/[^0-9]/g, "");
-              if (phone.length >= 10) {
+              if (/^[6-9]\d{9}$/.test(phone)) {
                 await whatsapp.sendDeliveryUpdate(phone, orderId.slice(-8).toUpperCase(), newStatus);
               }
             }
@@ -318,7 +318,7 @@ function startListeners() {
             // WhatsApp OTP
             if (order.userPhone) {
               const phone = order.userPhone.replace(/[^0-9]/g, "");
-              if (phone.length >= 10) {
+              if (/^[6-9]\d{9}$/.test(phone)) {
                 await whatsapp.sendOTP(phone, code);
               }
             }
@@ -1339,13 +1339,15 @@ setInterval(() => {
 
 // ─── Nodemailer Transporter ───
 function createMailTransporter() {
+  const cfg = configLoader.getConfig();
+  const smtp = cfg?.integrations?.smtp || {};
   return nodemailer.createTransport({
-    host: process.env.SMTP_HOST || "smtp.gmail.com",
-    port: parseInt(process.env.SMTP_PORT || "587"),
-    secure: process.env.SMTP_SECURE === "true",
+    host: smtp.host || process.env.SMTP_HOST || "smtp.gmail.com",
+    port: smtp.port || parseInt(process.env.SMTP_PORT || "587"),
+    secure: smtp.secure || process.env.SMTP_SECURE === "true",
     auth: {
-      user: process.env.SMTP_USER || "",
-      pass: process.env.SMTP_PASS || "",
+      user: smtp.user || process.env.SMTP_USER || "",
+      pass: smtp.pass || process.env.SMTP_PASS || "",
     },
   });
 }
@@ -1363,12 +1365,14 @@ app.post("/api/send-email-otp", async (req, res) => {
     const otp = generateOtp();
     emailOtpStore.set(email, { otp, phone, createdAt: Date.now() });
 
-    try {
-      const transporter = createMailTransporter();
-      await transporter.sendMail({
-        from: `"Grocery Store" <${process.env.SMTP_USER || ""}>`,
-        to: email,
-        subject: "Verify your phone number",
+      try {
+        const cfg = configLoader.getConfig();
+        const smtpUser = cfg?.integrations?.smtp?.user || process.env.SMTP_USER || "";
+        const transporter = createMailTransporter();
+        await transporter.sendMail({
+          from: `"Grocery Store" <${smtpUser}>`,
+          to: email,
+          subject: "Verify your phone number",
         html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
           <h2 style="color:#059669;">Phone Verification</h2>
           <p>Your verification code is:</p>
@@ -1432,9 +1436,11 @@ app.post("/api/send-delivery-otp", async (req, res) => {
     emailOtpStore.set(`delivery_${orderId}`, { otp, email, createdAt: Date.now() });
 
     try {
+      const cfg = configLoader.getConfig();
+      const smtpUser = cfg?.integrations?.smtp?.user || process.env.SMTP_USER || "";
       const transporter = createMailTransporter();
       await transporter.sendMail({
-        from: `"Grocery Store" <${process.env.SMTP_USER || ""}>`,
+        from: `"Grocery Store" <${smtpUser}>`,
         to: email,
         subject: `Delivery verification for Order #${orderId.slice(-8)}`,
         html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
@@ -1562,7 +1568,7 @@ app.post("/api/orders/cancel", verifyFirebaseToken, async (req, res) => {
     // WhatsApp cancellation notification
     if (order.userPhone) {
       const phone = order.userPhone.replace(/[^0-9]/g, "");
-      if (phone.length >= 10) {
+      if (/^[6-9]\d{9}$/.test(phone)) {
         whatsapp.sendOrderCancellation(phone, orderId, refundAmount);
       }
     }
@@ -1965,7 +1971,7 @@ app.post("/api/whatsapp/broadcast", verifyFirebaseToken, requireOwner, async (re
       if (data.address?.phone) phoneSet.add(data.address.phone.replace(/[^0-9]/g, ""));
     });
 
-    const phones = Array.from(phoneSet).filter(p => p.length >= 10);
+    const phones = Array.from(phoneSet).filter(p => /^[6-9]\d{9}$/.test(p));
     const result = await whatsapp.broadcast(phones, message);
     res.json({ success: true, ...result, totalPhones: phones.length });
   } catch (err) {

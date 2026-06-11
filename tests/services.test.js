@@ -242,8 +242,8 @@ describe("PincodeValidator", () => {
     global.fetch.mockRejectedValue(new Error("API unreachable"));
     const { validatePincode } = require("../services/pincodeValidator");
     const result = await validatePincode("415001");
-    expect(result.valid).toBe(true);
-    expect(result.fallback).toBeTruthy();
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/API unavailable/i);
   });
 
   it("returns fallback when PostOffice is empty", async () => {

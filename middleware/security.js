@@ -10,14 +10,7 @@ const helmetMiddleware = helmet({
 });
 
 // ─── CORS ───
-const BASE_ORIGINS = [
-  "https://customer-website-1.onrender.com",
-  "https://owner-dashboard-j73k.onrender.com",
-  "https://customer-website-1.onrender.com/",
-  "https://owner-dashboard-j73k.onrender.com/",
-];
 const ALLOWED_ORIGINS = [
-  ...BASE_ORIGINS,
   ...(process.env.ALLOWED_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
@@ -28,7 +21,9 @@ const corsMiddleware = cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGINS.length === 0) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    if (origin.startsWith("capacitor://")) return cb(null, true);
+    if (ALLOWED_ORIGINS.some((o) => origin.endsWith(o.substring(o.indexOf("://"))))) return cb(null, true);
+    if (origin.endsWith(".onrender.com") || origin.startsWith("capacitor://")) return cb(null, true);
+    console.warn(`[CORS] Blocked origin: ${origin}`);
     cb(new Error("Not allowed by CORS"));
   },
   credentials: true,

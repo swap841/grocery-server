@@ -8,6 +8,10 @@ async function validatePincode(pincode) {
     return { valid: false, error: "Pincode must be 6 digits" };
   }
 
+  if (pincode.startsWith("0")) {
+    return { valid: false, error: "Pincode must not start with 0" };
+  }
+
   const cached = cache.get(pincode);
   if (cached) return cached;
 
@@ -40,6 +44,7 @@ async function validatePincode(pincode) {
     // Fallback: basic regex check for common Indian pincodes
     const result = {
       valid: /^\d{6}$/.test(pincode),
+      fallback: true,
       pincode,
       city: "",
       state: "",

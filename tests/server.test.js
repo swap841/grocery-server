@@ -61,7 +61,7 @@ try {
 
 // ─── Load individual modules for unit testing ───────────────────────
 const { corsMiddleware, generalLimiter, apiKeyAuth, inputSanitizer, verifyFirebaseToken, requireOwner } = require("../middleware/security");
-const { validate, verifyDeliveryCodeSchema, paySalarySchema, sendSMSOTPSchema } = require("../middleware/validation");
+const { validate, verifyDeliveryCodeSchema, paySalarySchema } = require("../middleware/validation");
 const { loadConfig, getConfig } = require("../services/configLoader");
 
 // ─── Helper ─────────────────────────────────────────────────────────
@@ -343,8 +343,8 @@ describe("Validation middleware", () => {
       expect(res.status).toHaveBeenCalledWith(400);
     });
 
-    it("passes valid orderId + 6-digit code", () => {
-      const req = { body: { orderId: "ord1", code: "123456" }, query: {}, params: {} };
+    it("passes valid orderId + 4-digit code", () => {
+      const req = { body: { orderId: "ord1", code: "1234" }, query: {}, params: {} };
       const res = mockRes(); const next = jest.fn();
       validate(verifyDeliveryCodeSchema)(req, res, next);
       expect(next).toHaveBeenCalled();
@@ -384,29 +384,6 @@ describe("Validation middleware", () => {
       const req = { body: { collection: "workers", personId: "p1", amount: 1000, monthYear: "2026-01", mode: "UPI" }, query: {}, params: {} };
       const res = mockRes(); const next = jest.fn();
       validate(paySalarySchema)(req, res, next);
-      expect(next).toHaveBeenCalled();
-    });
-  });
-
-  describe("sendSMSOTPSchema", () => {
-    it("rejects invalid phone format", () => {
-      const req = { body: { phoneNumber: "abc", otp: "123456" }, query: {}, params: {} };
-      const res = mockRes(); const next = jest.fn();
-      validate(sendSMSOTPSchema)(req, res, next);
-      expect(res.status).toHaveBeenCalledWith(400);
-    });
-
-    it("rejects OTP that is not 6 digits", () => {
-      const req = { body: { phoneNumber: "9876543210", otp: "123" }, query: {}, params: {} };
-      const res = mockRes(); const next = jest.fn();
-      validate(sendSMSOTPSchema)(req, res, next);
-      expect(res.status).toHaveBeenCalledWith(400);
-    });
-
-    it("passes valid phone + OTP", () => {
-      const req = { body: { phoneNumber: "+919876543210", otp: "123456" }, query: {}, params: {} };
-      const res = mockRes(); const next = jest.fn();
-      validate(sendSMSOTPSchema)(req, res, next);
       expect(next).toHaveBeenCalled();
     });
   });
@@ -496,8 +473,8 @@ if (app) {
 
       it("rejects cancellation of a Delivered order", async () => {
         mockAuth.verifyIdToken.mockResolvedValueOnce({ uid: "u1" });
-        mockData["users/u1/orders/ord_delivered"] = docSnapshot({
-          status: "Delivered", items: [], totalAmount: 300, payment: { method: "cod" },
+        mockData["orders/ord_delivered"] = docSnapshot({
+          status: "Delivered", userId: "u1", items: [], totalAmount: 300, payment: { method: "cod" },
         }, true);
 
         const res = await request(app).post("/api/orders/cancel")
@@ -508,20 +485,16 @@ if (app) {
 
       it("successfully cancels a Pending order", async () => {
         mockAuth.verifyIdToken.mockResolvedValueOnce({ uid: "u1" });
-        mockData["users/u1/orders/ord_pending"] = docSnapshot({
-          status: "Pending", items: [{ productId: "p1", quantity: 2 }],
+        mockData["orders/ord_pending"] = docSnapshot({
+          status: "Pending", userId: "u1", items: [{ productId: "p1", quantity: 2 }],
           totalAmount: 300, payment: { method: "cod" },
         }, true);
-
-        const mockBatch = { set: jest.fn(), update: jest.fn(), delete: jest.fn(), commit: jest.fn(() => Promise.resolve()) };
-        mockFirestore.batch.mockReturnValueOnce(mockBatch);
 
         const res = await request(app).post("/api/orders/cancel")
           .set("Authorization", "Bearer valid_token")
           .send({ orderId: "ord_pending", userId: "u1", reason: "Changed mind" });
         expect(res.status).toBe(200);
         expect(res.body.success).toBe(true);
-        expect(mockBatch.commit).toHaveBeenCalled();
       });
     });
 
@@ -1000,10 +973,11 @@ describe("Edge cases", () => {
       expect(res.status).toHaveBeenCalledWith(400);
     });
 
-    it("sendSMSOTP rejects phone number shorter than 10 digits", () => {
-      const req = { body: { phoneNumber: "123456789", otp: "123456" }, query: {}, params: {} };
+    it("sendOTPFcm rejects phone number shorter than 10 digits", () => {
+      const req = { body: { phoneNumber: "123456789", userId: "u1" }, query: {}, params: {} };
       const res = mockRes(); const next = jest.fn();
-      validate(sendSMSOTPSchema)(req, res, next);
+      const { sendOTPFcmSchema } = require("../middleware/validation");
+      validate(sendOTPFcmSchema)(req, res, next);
       expect(res.status).toHaveBeenCalledWith(400);
     });
   });
